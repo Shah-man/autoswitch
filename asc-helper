@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# asc-helper — привилегированный помощник autoswitch.
+# Выполняет ТОЛЬКО строго заданные операции над файлами autoswitch.
+# Вызывается через pkexec; polkit-действие org.autoswitch.helper.edit
+# (org.autoswitch.helper.policy) разрешает запуск без пароля активному
+# локальному пользователю. Всё привилегированное идёт через этот helper:
+# правка конфига/словаря И управление службой autoswitch.service.
+#
+# Смысл: не давать GUI прав на произвольный "pkexec sh -c ...", а ограничить
+# рут ровно нужными действиями над /etc/autoswitch/*. Это и безопаснее,
+# и позволяет polkit пускать без пароля (известное действие, а не любой shell).
+
+set -euo pipefail
+
+CFGDIR="/etc/autoswitch"
+CONFIG="$CFGDIR/config"
+UW="$CFGDIR/user_words.txt"
+LEARNED="$CFGDIR/learned.txt"
+GEN="/usr/local/lib/autoswitch/config_template.py"
+# Журнал лежит в домашней папке того, кто вызвал (asc запускается от него
+# через pkexec, исходный пользователь — в PKEXEC_UID).
+_loguser="$(getent passwd "${PKEXEC_UID:-${SUDO_UID:-0}}" 2>/dev/null | cut -d: -f1)"
+_loghome="$(getent passwd "${PKEXEC_UID:-${SUDO_UID:-0}}" 2>/dev/null | cut -d: -f6)"
+LOGFILE="${_loghome}/Applications/autoswitch.logs/autoswitch.log"
+SERVICE="autoswitch.service"
+
+usage() {
+    echo "usage: asc-helper set-config KEY VALUE" >&2
+    echo "       asc-helper write-config   < FILE" >&2
+    echo "       asc-helper write-words    < FILE" >&2
+    echo "       asc-helper write-learned  < FILE" >&2
+    echo "       asc-helper relang-config ru|en" >&2
+    echo "       asc-helper clear-log" >&2
+    echo "       asc-helper service start|stop|restart|enable|disable" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift || true
+
+case "$cmd" in
+    clear-log)
+        # clear-log — стереть журнал autoswitch. Мы пишем в СВОЙ файл, а не
+        # в системный журнал, поэтому чистится ровно наш лог и ничего чужого.
+        # Смысл: при включённом debug_log в лог попадают набранные слова.
+        : > "$LOGFILE" 2>/dev/null || true
+        chmod 640 "$LOGFILE" 2>/dev/null || true
+        ;;
+    service)
+        # service ACTION — управление ТОЛЬКО службой autoswitch.service.
+        # Вынесено в helper, чтобы всё привилегированное шло одним каналом
+        # (одно polkit-действие без пароля), а не через отдельный
+        # "pkexec systemctl", который требовал бы своё правило.
+        [ $# -eq 1 ] || usage
+        action="$1"
+        case "$action" in
+            start|stop|restart|enable|disable)
+                exec systemctl "$action" "$SERVICE"
+                ;;
+            *)
+                echo "bad service action" >&2; exit 3 ;;
+        esac
+        ;;
+    set-config)
+        # set-config KEY VALUE — обновить или добавить одну пару key=value
+        [ $# -eq 2 ] || usage
+        key="$1"; value="$2"
+        # ключ: только буквы/цифры/подчёркивание (защита от инъекций в sed)
+        case "$key" in
+            *[!A-Za-z0-9_]*) echo "bad key" >&2; exit 3 ;;
+        esac
+        mkdir -p "$CFGDIR"
+        touch "$CONFIG"
+        if grep -qE "^${key}=" "$CONFIG" 2>/dev/null; then
+            sed -i "s#^${key}=.*#${key}=${value}#" "$CONFIG"
+        else
+            printf '%s=%s\n' "$key" "$value" >> "$CONFIG"
+        fi
+        ;;
+    relang-config)
+        # relang-config LANG — перевыпустить конфиг на языке LANG (ru|en),
+        # СОХРАНив все значения пользователя. Используется при смене языка
+        # интерфейса, чтобы комментарии конфига тоже стали на новом языке.
+        [ $# -eq 1 ] || usage
+        lang="$1"
+        case "$lang" in ru|en) ;; *) echo "bad lang" >&2; exit 3 ;; esac
+        [ -f "$GEN" ] || { echo "no generator" >&2; exit 4 ; }
+        mkdir -p "$CFGDIR"
+        tmp="$CONFIG.tmp.$$"
+        if python3 "$GEN" render "$lang" "$CONFIG" > "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$CONFIG"
+            chmod 644 "$CONFIG"
+        else
+            rm -f "$tmp"; echo "render failed" >&2; exit 5
+        fi
+        ;;
+    write-config)
+        # write-config — записать весь конфиг из stdin
+        mkdir -p "$CFGDIR"
+        cat > "$CONFIG"
+        chmod 644 "$CONFIG"
+        ;;
+    write-words)
+        # write-words — записать user_words.txt из stdin
+        mkdir -p "$CFGDIR"
+        cat > "$UW"
+        chmod 644 "$UW"
+        ;;
+    write-learned)
+        # write-learned — записать learned.txt («Мой словарь») из stdin.
+        # Формат каждой строки:  US-форма<TAB>ru|us  ЛИБО  US-форма (без
+        # языка — тогда трактуем как 'us', совместимость со старым списком
+        # тех-словаря). Нормализуем и отсеиваем мусор здесь, чтобы кривой
+        # ввод из GUI не сломал разбор в службе.
+        mkdir -p "$CFGDIR"
+        tmp="$LEARNED.tmp.$$"
+        {
+            echo "# autoswitch: мой словарь (US-форма<TAB>ru|us)."
+            echo "# Пополняется автоматически при отмене исправлений и вручную."
+            awk '
+                { sub(/\r$/,"") }                       # CRLF -> LF
+                /^[[:space:]]*#/ { next }               # комментарии
+                /^[[:space:]]*$/ { next }               # пустые
+                {
+                    # первое поле — слово, второе (если есть) — язык
+                    form=$1; lang=$2
+                    gsub(/[[:space:]]/,"",form)
+                    lang=tolower(lang)
+                    if (form=="") next
+                    if (lang!="ru" && lang!="us") lang="us"
+                    print tolower(form) "\t" lang
+                }
+            ' | sort -u
+        } > "$tmp"
+        mv -f "$tmp" "$LEARNED"
+        chmod 644 "$LEARNED"
+        ;;
+    *)
+        usage
+        ;;
+esac

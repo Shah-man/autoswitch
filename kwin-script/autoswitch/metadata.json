@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Id": "autoswitch",
+        "Name": "Autoswitch Focus Bridge",
+        "Name[ru]": "Autoswitch: мост активного окна",
+        "Description": "Reports the active window class to autoswitch. Required for per-application exclusions on Wayland.",
+        "Description[ru]": "Сообщает autoswitch класс активного окна. Нужен для исключений приложений на Wayland.",
+        "Icon": "input-keyboard-symbolic",
+        "Authors": [
+            {
+                "Name": "Shah-man",
+                "Web": "https://github.com/Shah-man/autoswitch"
+            }
+        ],
+        "License": "MIT",
+        "Version": "1",
+        "Website": "https://github.com/Shah-man/autoswitch"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

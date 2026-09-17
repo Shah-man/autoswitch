@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "shah-man"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Tray indicator for the autoswitch keyboard layout switcher",
+        "Description[ru]": "Индикатор автопереключателя раскладки клавиатуры",
+        "Icon": "autoswitch-indicator",
+        "Id": "org.shah-man.autoswitch",
+        "License": "GPL-3.0-or-later",
+        "Name": "Autoswitch",
+        "Name[ru]": "Autoswitch",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}

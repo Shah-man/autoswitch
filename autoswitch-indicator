@@ -1,0 +1,1953 @@
+#!/usr/bin/env python3
+"""autoswitch-indicator — индикатор autoswitch в системном трее (X11/XFCE и др.).
+
+Аналог GNOME-расширения, но для окружений с системным треем (XFCE, KDE, MATE,
+Cinnamon, Budgie). Показывает статус службы цветным индикатором и даёт меню
+управления.
+
+Используется Gtk.StatusIcon, а НЕ AppIndicator. Причина: AppIndicator отдаёт
+меню панели через DBusMenu, который выбрасывает разметку текста и кладёт любую
+картинку в свою левую колонку — из-за этого цветной кружок и буквы asc нельзя
+поставить в строку. Gtk.StatusIcon рисует меню локально силами GTK, поэтому
+Pango-разметка работает и цвет ставится прямо в тексте.
+
+Требует: python3-gi, gir1.2-gtk-3.0
+"""
+
+import os
+import re
+import sys
+import glob
+import time
+import signal
+import hashlib
+import atexit
+import shutil
+import socket
+import subprocess
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gio, Gdk, GdkPixbuf
+
+# --- библиотека индикатора для окружений без XEmbed-трея (KDE Plasma) ---
+# Не обязательна: если её нет, работаем на Gtk.StatusIcon.
+_Ind = None
+for _lib in ('AyatanaAppIndicator3', 'AppIndicator3'):
+    try:
+        gi.require_version(_lib, '0.1')
+        if _lib == 'AyatanaAppIndicator3':
+            from gi.repository import AyatanaAppIndicator3 as _Ind  # noqa
+        else:
+            from gi.repository import AppIndicator3 as _Ind  # noqa
+        break
+    except (ValueError, ImportError):
+        _Ind = None
+
+# --- gtk-layer-shell: позиционирование меню на wlroots ---
+# На Wayland всплывающее окно обязано быть прицеплено к обычному окну,
+# которое уже на экране, — своего окна у индикатора нет. Заводим пустое
+# окно-якорь, но обычное окно координаты себе не выбирает: композитор
+# ставит его как хочет, а wlroots ещё и берёт в раскладку, сдвигая
+# соседние окна. Layer-shell объявляет окно слоевой поверхностью: такие
+# в раскладку не берут и им можно задать край и отступы — значит якорь
+# встаёт точно под значком. Через тот же протокол работает waybar.
+# Нет библиотеки — меню всплывёт там, где решит композитор, но работать
+# не перестанет.
+_LS = None
+try:
+    gi.require_version('GtkLayerShell', '0.1')
+    from gi.repository import GtkLayerShell as _LS  # noqa
+    # Мало того, что библиотека установлена: layer-shell — протокол
+    # wlroots, и ни Mutter (GNOME), ни KWin (KDE) его не знают. А сама
+    # библиотека может стоять там как зависимость чего-то ещё. Спросим
+    # у композитора напрямую: не поддерживает — работаем без якоря, как
+    # раньше, вместо попытки создать поверхность, которой негде взяться.
+    if hasattr(_LS, 'is_supported') and not _LS.is_supported():
+        _LS = None
+except (ValueError, ImportError):
+    _LS = None
+
+
+# Сколько ждать появления XEmbed-лотка при старте сессии. В автозапуске
+# индикатор и панель поднимаются разом, и лоток заявляет о себе не мгновенно:
+# без ожидания проверка соврёт и на XFCE значок уедет в AppIndicator.
+_TRAY_WAIT = 3.0
+
+
+def _xembed_tray_present(timeout=_TRAY_WAIT):
+    """Есть ли на экране XEmbed-лоток.
+
+    Лоток объявляет себя владельцем выделения _NET_SYSTEM_TRAY_S<номер экрана>.
+    Нет владельца — Gtk.StatusIcon рисовать негде, значок не появится вовсе
+    (панель LXQt 2 даёт только StatusNotifier, старый лоток из неё убран).
+    Спрашиваем у X напрямую, а не гадаем по имени окружения.
+
+    Ждём до timeout секунд: выходим сразу, как только владелец найден.
+    При любой ошибке отвечаем True — то есть остаёмся на прежнем поведении.
+    """
+    try:
+        from Xlib import display as _xd
+    except Exception:
+        return True
+    try:
+        d = _xd.Display()
+    except Exception:
+        return True
+    try:
+        atom = d.get_atom('_NET_SYSTEM_TRAY_S%d' % d.get_default_screen())
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if d.get_selection_owner(atom):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+    except Exception:
+        return True
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def _svg_to_argb32(path, size=22):
+    """Отрисовать SVG и вернуть (ширина, высота, байты) для IconPixmap.
+
+    Формат задан спецификацией StatusNotifierItem: ARGB32, по строкам,
+    сетевой порядок байт — то есть каждый пиксель это A, R, G, B. У
+    GdkPixbuf порядок другой (R, G, B, A), поэтому переставляем.
+    """
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size, size, True)
+        if not pb.get_has_alpha():
+            pb = pb.add_alpha(False, 0, 0, 0)
+        w, h = pb.get_width(), pb.get_height()
+        stride = pb.get_rowstride()
+        src = pb.get_pixels()
+        out = bytearray(w * h * 4)
+        i = 0
+        for row in range(h):
+            base = row * stride
+            for col in range(w):
+                o = base + col * 4
+                out[i] = src[o + 3]      # A
+                out[i + 1] = src[o]      # R
+                out[i + 2] = src[o + 1]  # G
+                out[i + 3] = src[o + 2]  # B
+                i += 4
+        return w, h, bytes(out)
+    except Exception:
+        return None
+
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <method name="Activate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="ContextMenu">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg name="delta" type="i" direction="in"/>
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <signal name="NewIcon"/>
+    <signal name="NewTitle"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+WATCHER = 'org.kde.StatusNotifierWatcher'
+SNI_PATH = '/StatusNotifierItem'
+
+
+class SNIItem:
+    """Значок в трее без libayatana.
+
+    Смысл затеи — левый клик. libayatana обязательно экспортирует меню, а
+    панель, увидев меню, показывает его сама и метод Activate нам не шлёт.
+    Объявляя себя StatusNotifierItem напрямую, мы меню не отдаём и ставим
+    ItemIsMenu=false — тогда панель обязана слать Activate, и нажатие на
+    значок становится нашим. Заодно исчезает привязка к версии панели:
+    это чистый D-Bus, одинаковый в LXQt, Plasma и waybar.
+    """
+
+    def __init__(self, item_id, title, theme_path,
+                 on_activate=None, on_secondary=None, on_context=None):
+        self.item_id = item_id
+        self.title = title
+        self.theme_path = theme_path
+        self.icon_name = ''
+        self.icon_pixmap = None   # (ширина, высота, байты ARGB32)
+        self.status = 'Active'
+        self._on_activate = on_activate
+        self._on_secondary = on_secondary
+        self._on_context = on_context
+        self._reg_id = None
+        self.ok = False
+
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        self._reg_id = self.bus.register_object(
+            SNI_PATH, info, self._call, self._get, None
+        )
+        self.bus_name = 'org.kde.StatusNotifierItem-%d-1' % os.getpid()
+        self._own_id = None
+        self._claim()
+        # Панель могут перезапустить — тогда наблюдатель поднимется заново
+        # и про нас забудет. Следим за появлением имени и объявляемся снова.
+        self._watch_id = Gio.bus_watch_name_on_connection(
+            self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE,
+            lambda *a: self._register(), None
+        )
+        self._register()
+
+    def dispose(self):
+        """Полностью убрать себя с шины.
+
+        Нужно, когда мы отказались от своего значка в пользу libayatana:
+        брошенный объект иначе продолжает жить (его держит наблюдатель
+        имени) и позже объявляется у панели сам. Тогда в одном процессе
+        оказываются два значка, и клики достаются то одному, то другому.
+        """
+        try:
+            if self._watch_id is not None:
+                Gio.bus_unwatch_name(self._watch_id)
+                self._watch_id = None
+        except Exception:
+            pass
+        self._release()
+        try:
+            if self._reg_id is not None:
+                self.bus.unregister_object(self._reg_id)
+                self._reg_id = None
+        except Exception:
+            pass
+        self.ok = False
+
+    def _claim(self):
+        if self._own_id is not None:
+            return
+        self._own_id = Gio.bus_own_name_on_connection(
+            self.bus, self.bus_name, Gio.BusNameOwnerFlags.NONE, None, None
+        )
+
+    def _release(self):
+        if self._own_id is None:
+            return
+        try:
+            Gio.bus_unown_name(self._own_id)
+        except Exception:
+            pass
+        self._own_id = None
+
+    def _register(self):
+        try:
+            self.bus.call_sync(
+                WATCHER, '/StatusNotifierWatcher', WATCHER,
+                'RegisterStatusNotifierItem',
+                GLib.Variant('(s)', (self.bus_name,)),
+                None, Gio.DBusCallFlags.NONE, 3000, None
+            )
+            self.ok = True
+        except Exception:
+            pass
+
+    def _get(self, _conn, _sender, _path, _iface, name):
+        if name == 'Category':
+            return GLib.Variant('s', 'ApplicationStatus')
+        if name == 'Id':
+            return GLib.Variant('s', self.item_id)
+        if name == 'Title':
+            return GLib.Variant('s', self.title)
+        if name == 'Status':
+            return GLib.Variant('s', self.status)
+        if name == 'IconName':
+            return GLib.Variant('s', self.icon_name)
+        if name == 'IconThemePath':
+            return GLib.Variant('s', self.theme_path)
+        if name == 'IconPixmap':
+            # Пиксели вместо имени. Имя панель ищет сама, в своём кеше
+            # иконочной темы: меняем размер точки — меняется имя файла,
+            # панель про новый файл ещё не знает и рисует заглушку
+            # «иконка не найдена» — тот самый квадратик. Причём через раз:
+            # если этим размером уже пользовались, файл попал в кеш при
+            # запуске панели и всё рисуется верно. Отдавая пиксели, мы
+            # выбрасываем из цепочки и тему, и кеш, и имена файлов.
+            if not self.icon_pixmap:
+                return GLib.Variant('a(iiay)', [])
+            w, h, data = self.icon_pixmap
+            return GLib.Variant('a(iiay)', [(w, h, data)])
+        if name == 'ItemIsMenu':
+            return GLib.Variant('b', False)
+        if name == 'ToolTip':
+            return GLib.Variant('(sa(iiay)ss)',
+                                ('', [], self.title, ''))
+        return None
+
+    def _call(self, _conn, _sender, _path, _iface, method, params, inv):
+        # Панель присылает координаты значка на экране — по ним меню можно
+        # поставить точно над ним, а не там, где случайно стоит курсор.
+        try:
+            x, y = params.unpack()
+        except Exception:
+            x = y = None
+        if method == 'Activate' and self._on_activate:
+            self._on_activate(x, y)
+        elif method == 'SecondaryActivate' and self._on_secondary:
+            self._on_secondary(x, y)
+        elif method == 'ContextMenu' and self._on_context:
+            self._on_context(x, y)
+        inv.return_value(None)
+
+    def _emit(self, signal, args=None):
+        try:
+            self.bus.emit_signal(
+                None, SNI_PATH, 'org.kde.StatusNotifierItem', signal, args
+            )
+        except Exception:
+            pass
+
+    def set_icon(self, name_or_path):
+        """Сменить значок: путь к файлу — отдаём пикселями, иначе именем.
+
+        Пиксели надёжнее: панель не ищет файл в своём кеше темы и не
+        показывает заглушку, когда имя ей ещё незнакомо.
+        """
+        if '/' in name_or_path:
+            pm = _svg_to_argb32(name_or_path)
+            if pm is not None:
+                self.icon_pixmap = pm
+                # имя обязано быть пустым: увидев непустое, панель
+                # предпочтёт искать по нему и пиксели проигнорирует
+                self.icon_name = ''
+                self._emit('NewIcon')
+                return
+            # отрисовать не вышло — откатываемся на имя без расширения
+            name_or_path = os.path.splitext(
+                os.path.basename(name_or_path))[0]
+        self.icon_pixmap = None
+        self.icon_name = name_or_path
+        self._emit('NewIcon')
+
+    def set_status(self, active):
+        """Показать или убрать значок.
+
+        Одного статуса Passive мало: часть панелей, включая LXQt, рисует и
+        такие значки. Поэтому при выключении уходим из шины совсем — панель
+        видит, что нас больше нет, и убирает значок. При включении имя
+        занимаем заново и объявляемся у наблюдателя.
+        """
+        want = 'Active' if active else 'Passive'
+        if want == self.status and (self._own_id is not None) == active:
+            return
+        self.status = want
+        if active:
+            self._claim()
+            self._register()
+            self._emit('NewStatus', GLib.Variant('(s)', (self.status,)))
+        else:
+            self._emit('NewStatus', GLib.Variant('(s)', (self.status,)))
+            self._release()
+
+
+def _panel_edge(px, py, wa):
+    """Найти край панели у точки (px, py).
+
+    Рабочая область тут не помощник: панель LXQt место под себя не
+    резервирует, и _NET_WORKAREA равна всему экрану. Зато сама панель —
+    окно типа _NET_WM_WINDOW_TYPE_DOCK, и её геометрию можно спросить у X.
+
+    Возвращает ('bottom', y) — панель снизу, y её верхний край;
+    ('top', y) — панель сверху, y её нижний край; None — не нашлась.
+    """
+    try:
+        from Xlib import display as _xd, X
+    except Exception:
+        return None
+    try:
+        d = _xd.Display()
+    except Exception:
+        return None
+    try:
+        root = d.screen().root
+        a_type = d.get_atom('_NET_WM_WINDOW_TYPE')
+        a_dock = d.get_atom('_NET_WM_WINDOW_TYPE_DOCK')
+        mid = wa.y + wa.height / 2.0
+        best = None
+        docks = []
+
+        def walk(w, depth=0):
+            # Панель не обязана лежать среди детей root: Openbox и другие
+            # менеджеры вешают её внутрь своей рамки. Двух уровней хватает.
+            if depth > 3:
+                return
+            try:
+                kids = w.query_tree().children
+            except Exception:
+                return
+            for k in kids:
+                try:
+                    p = k.get_full_property(a_type, X.AnyPropertyType)
+                    if p and a_dock in list(p.value):
+                        g = k.get_geometry()
+                        t = k.translate_coords(root, 0, 0)
+                        docks.append((-t.x, -t.y, g.width, g.height))
+                except Exception:
+                    pass
+                walk(k, depth + 1)
+
+        walk(root)
+        for wx, wy, ww, wh in docks:
+            if ww < wh or ww < 2 or wh < 2:
+                continue  # вертикальные панели и окна-пустышки
+            if not (wx <= px <= wx + ww):
+                continue
+            if wy + wh / 2.0 > mid:
+                cand = ('bottom', wy)
+            else:
+                cand = ('top', wy + wh)
+            if best is None or abs(cand[1] - py) < abs(best[1] - py):
+                best = cand
+        return best
+    except Exception:
+        return None
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def _pick_backend():
+    """Выбрать способ показа значка.
+
+    StatusIcon (XEmbed) даёт меню с цветом и разметкой, но XEmbed есть
+    не везде: KDE Plasma 6 его убрала, а wlroots-композиторы (sway,
+    Hyprland) не имели никогда — там трей работает только по протоколу
+    StatusNotifierItem, то есть через AppIndicator. Меню в этом случае
+    уходит панели через DBusMenu, и разметка с цветом теряются.
+
+    Поэтому: Wayland (кроме GNOME) и Plasma — AppIndicator,
+    всё остальное — StatusIcon.
+
+    Переопределить можно переменной окружения:
+        AUTOSWITCH_TRAY=appindicator | statusicon
+    """
+    forced = (os.environ.get('AUTOSWITCH_TRAY') or '').strip().lower()
+    if forced == 'statusicon':
+        return 'statusicon'
+    if forced == 'appindicator':
+        return 'appindicator' if _Ind else 'statusicon'
+
+    desktop = (os.environ.get('XDG_CURRENT_DESKTOP') or '').lower()
+    session = (os.environ.get('DESKTOP_SESSION') or '').lower()
+    stype = (os.environ.get('XDG_SESSION_TYPE') or '').lower()
+
+    both = desktop + ' ' + session
+    is_plasma = any(k in both for k in ('kde', 'plasma'))
+    # wlroots-композиторы (sway, Hyprland) XEmbed не умеют вовсе: трей там
+    # даёт waybar и подобные, и только по протоколу SNI.
+    is_wlroots = any(k in both for k in ('sway', 'hyprland', 'river', 'wayfire'))
+    # прочие Wayland-сессии, кроме GNOME (там значок даёт расширение)
+    is_other_wayland = (stype == 'wayland' and 'gnome' not in both)
+
+    if _Ind is not None and (is_plasma or is_wlroots or is_other_wayland):
+        return 'appindicator'
+    # X11 без XEmbed-лотка (LXQt 2 и подобные): StatusIcon показывать негде
+    if _Ind is not None and stype != 'wayland' and not _xembed_tray_present():
+        return 'appindicator'
+    return 'statusicon'
+
+
+SERVICE = 'autoswitch.service'
+APP_ID = 'autoswitch-indicator'
+CONFIG = '/etc/autoswitch/config'
+
+
+# Конфиг читают два цикла (видимость раз в 2 сек, состояние раз в 3 сек)
+# плюс проверка языка. Файл крошечный, но открывать его пять раз в секунду
+# незачем — держим разобранные значения и перечитываем только по mtime.
+_cfg_cache = {'mtime': -1.0, 'data': {}}
+
+
+def _cfg_all():
+    try:
+        mt = os.path.getmtime(CONFIG)
+    except OSError:
+        return _cfg_cache['data']
+    if mt != _cfg_cache['mtime']:
+        data = {}
+        try:
+            with open(CONFIG, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    k, v = line.split('=', 1)
+                    data[k.strip()] = v.strip()
+        except Exception:
+            return _cfg_cache['data']
+        _cfg_cache['mtime'] = mt
+        _cfg_cache['data'] = data
+    return _cfg_cache['data']
+
+
+def _indicator_enabled():
+    """Читать show_indicator из конфига. По умолчанию on."""
+    val = _cfg_all().get('show_indicator', '').lower()
+    return val not in ('off', '0', 'no', 'false')
+
+
+# --- язык интерфейса: общий с asc/asc-gui через ui_lang в конфиге ---
+def _ui_lang():
+    """ru|en из конфига; если не задан — по системной локали."""
+    v = _cfg_all().get('ui_lang', '').lower()
+    if v in ('ru', 'en'):
+        return v
+    loc = (os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES')
+           or os.environ.get('LANG') or '')
+    return 'ru' if loc.lower().startswith('ru') else 'en'
+
+
+T = {
+    'ru': {
+        'status': 'Статус',
+        'start': 'Запустить',
+        'stop': 'Остановить',
+        'restart': 'Перезапустить',
+        'prefs': 'Расширение',
+        'settings': 'Настройки',
+        'open_menu': 'Открыть меню Autoswitch',
+        'quit': 'Выход',
+        'running': 'работает',
+        'stopped': 'остановлен',
+        'error': 'ошибка',
+        'p_title': 'Индикатор в панели',
+        'p_about': ('Цветной индикатор в системном лотке показывает состояние '
+                    'службы autoswitch: зелёный — работает, светлый — '
+                    'остановлен, красный — ошибка.\n'
+                    'Здесь настраивается его внешний вид: диаметр индикатора '
+                    'и цвет каждого состояния. Изменения применяются сразу.'),
+        'p_group': 'Индикатор',
+        'p_size': 'Размер индикатора',
+        'p_size_d': 'Диаметр в пикселях (6–16)',
+        'p_colors': 'Цвета состояний',
+        'p_colors_d': 'Цвет индикатора для каждого состояния службы.',
+        'p_running': 'Работает',
+        'p_running_d': 'Служба запущена и активна',
+        'p_stopped': 'Остановлен',
+        'p_stopped_d': 'Служба выключена пользователем',
+        'p_error': 'Ошибка',
+        'p_error_d': 'Служба упала или не запустилась',
+        'p_reset': 'Сбросить по умолчанию',
+        'p_reset_d': 'Размер %d px, стандартные цвета',
+        'p_reset_btn': 'Сбросить',
+    },
+    'en': {
+        'status': 'Status',
+        'start': 'Start',
+        'stop': 'Stop',
+        'restart': 'Restart',
+        'prefs': 'Extension',
+        'settings': 'Settings',
+        'open_menu': 'Open Autoswitch menu',
+        'quit': 'Quit',
+        'running': 'running',
+        'stopped': 'stopped',
+        'error': 'error',
+        'p_title': 'Panel indicator',
+        'p_about': ('The coloured tray indicator shows the autoswitch service '
+                    'state: green — running, light — stopped, red — error.\n'
+                    'Here you can set its look: indicator diameter and the '
+                    'colour of each state. Changes apply immediately.'),
+        'p_group': 'Indicator',
+        'p_size': 'Indicator size',
+        'p_size_d': 'Diameter in pixels (6–16)',
+        'p_colors': 'State colours',
+        'p_colors_d': 'Indicator colour for each service state.',
+        'p_running': 'Running',
+        'p_running_d': 'Service is up and active',
+        'p_stopped': 'Stopped',
+        'p_stopped_d': 'Service switched off by the user',
+        'p_error': 'Error',
+        'p_error_d': 'Service crashed or failed to start',
+        'p_reset': 'Reset to defaults',
+        'p_reset_d': 'Size %d px, standard colours',
+        'p_reset_btn': 'Reset',
+    },
+}
+
+
+def t(key):
+    lang = _ui_lang()
+    return T.get(lang, T['en']).get(key, T['en'].get(key, key))
+
+
+# --- настройки внешнего вида индикатора (аналог GSettings на GNOME) ---
+# GNOME-расширение хранит их в GSettings, т.е. на уровне пользователя.
+# Прямой аналог для X11 — файл в ~/.config. В /etc/autoswitch/config писать
+# нельзя без root, а спрашивать пароль ради размера индикатора незачем.
+USER_CONF_DIR = os.path.join(GLib.get_user_config_dir(), 'autoswitch')
+USER_CONF = os.path.join(USER_CONF_DIR, 'indicator.conf')
+
+DEFAULTS = {
+    'dot_size': 10,      # диаметр индикатора, px (как на GNOME)
+    # Цвета состояний — те же значения, что по умолчанию в GNOME-расширении
+    # и в апплете Plasma, чтобы индикатор везде выглядел одинаково.
+    'color_running': '#33d17a',
+    'color_stopped': '#deddda',
+    'color_error':   '#e01b24',
+}
+LIMITS = {
+    'dot_size': (6, 16),
+}
+
+# Ключи-цвета хранятся строкой, а не числом, поэтому разбираются отдельно.
+COLOR_KEYS = ('color_running', 'color_stopped', 'color_error')
+
+# Отступов по бокам здесь нет намеренно. В GNOME и Plasma индикатор рисует
+# сама оболочка, и поле вокруг значка ей можно задать. В XEmbed-трее
+# (XFCE, MATE, Cinnamon) значок — отдельное окно, которое панель вставляет
+# в свою ячейку: ни отступа, ни поля она не предусматривает. Единственный
+# способ «отодвинуть» значок — расширить саму картинку, но тогда панель
+# вписывает её в квадрат и круг превращается в эллипс.
+
+
+def load_prefs():
+    """Прочитать настройки индикатора. Чего нет — берётся из DEFAULTS."""
+    vals = dict(DEFAULTS)
+    try:
+        with open(USER_CONF, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip()
+                if k in COLOR_KEYS:
+                    if re.fullmatch(r'#[0-9a-fA-F]{6}', v):
+                        vals[k] = v.lower()
+                    continue
+                if k in vals:
+                    try:
+                        n = int(v)
+                    except ValueError:
+                        continue
+                    lo, hi = LIMITS[k]
+                    vals[k] = max(lo, min(hi, n))
+    except Exception:
+        pass
+    return vals
+
+
+def save_prefs(vals):
+    """Записать настройки индикатора."""
+    try:
+        os.makedirs(USER_CONF_DIR, exist_ok=True)
+        with open(USER_CONF, 'w', encoding='utf-8') as f:
+            f.write('# настройки индикатора autoswitch\n')
+            for k in DEFAULTS:
+                f.write(f'{k}={vals.get(k, DEFAULTS[k])}\n')
+    except Exception:
+        pass
+
+
+# каталог с иконками статуса (зелёный/светлый/красный индикатор)
+ICON_DIR = os.path.join(
+    GLib.get_user_data_dir(), 'autoswitch-indicator', 'icons'
+)
+
+# Запасные цвета: применяются, пока настройки не прочитаны, и для
+# состояния «неизвестно», которое пользователь не настраивает.
+COLORS = {
+    'running': '#33d17a',
+    'stopped': '#deddda',
+    'error':   '#e01b24',
+    'unknown': '#9a9996',
+}
+
+
+def _text_color(hex_color):
+    """Приглушить слишком светлый цвет, чтобы слово читалось.
+
+    Цвет состояния подбирается для кружка на панели, где светло-серый виден
+    прекрасно. В меню тот же цвет на светлом фоне почти пропадает, поэтому
+    для текста затемняем всё, что светлее разумного. Кружок при этом
+    остаётся прежним — меняется только надпись.
+    """
+    try:
+        s = hex_color.lstrip('#')
+        r, g, b = (int(s[i:i + 2], 16) for i in (0, 2, 4))
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        if lum <= 0.62:
+            return hex_color
+        k = 0.62 / lum
+        return '#{:02x}{:02x}{:02x}'.format(
+            int(r * k), int(g * k), int(b * k)
+        )
+    except Exception:
+        return hex_color
+
+
+def state_colors(prefs):
+    """Цвета состояний с учётом настроек пользователя."""
+    return {
+        'running': prefs.get('color_running', COLORS['running']),
+        'stopped': prefs.get('color_stopped', COLORS['stopped']),
+        'error':   prefs.get('color_error', COLORS['error']),
+        'unknown': COLORS['unknown'],
+    }
+
+# цвета логотипа asc. Оттенки те же, что в GNOME-расширении, но осветлены:
+# на тёмных темах XFCE исходный синий #0074ff почти проваливается в фон.
+ASC_COLORS = ('#4ce660', '#4da6ff', '#ffa733')
+
+
+def _write_icon(state, color, size):
+    """SVG-кружок индикатора нужного цвета и диаметра.
+
+    Холст всегда квадратный, 22×22 — обычный размер значка в трее. Панель
+    масштабирует картинку под свою высоту, поэтому важен не абсолютный
+    пиксель, а пропорция круга к холсту. Квадрат тут обязателен: панель
+    вписывает значок в квадратную ячейку, и прямоугольная картинка
+    сплющивается вместе с кругом.
+    """
+    os.makedirs(ICON_DIR, exist_ok=True)
+    path = os.path.join(ICON_DIR, f'autoswitch-{state}.svg')
+    h = 22
+    w = h
+    r = size / 2.0
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}">\n'
+        f'  <circle cx="{w / 2.0}" cy="{h / 2.0}" r="{r}" fill="{color}"/>\n'
+        '</svg>\n'
+    )
+    with open(path, 'w') as f:
+        f.write(svg)
+    return path
+
+
+# AppIndicator (KDE, wlroots) получает иконку ПО ИМЕНИ и ищет её в
+# каталоге темы, а не в плоской папке. Поэтому дублируем файлы в
+# структуру XDG: <база>/hicolor/scalable/apps/<имя>.svg
+THEME_DIR = os.path.join(ICON_DIR, 'hicolor', 'scalable', 'apps')
+
+# Панель LXQt в IconThemePath не заглядывает вовсе: имя значка она ищет
+# только по стандартным путям XDG. Поэтому кладём копии ещё и в домашнюю
+# иконочную тему — оттуда их видит любая панель, и Qt, и GTK.
+USER_ICON_DIR = os.path.join(
+    GLib.get_user_data_dir(), 'icons', 'hicolor', 'scalable', 'apps'
+)
+
+# Имена значков состояний для панели: заполняется в _ensure_icons.
+# Ключ — состояние, значение — имя без расширения.
+ICON_NAMES = {}
+
+
+def _write_theme_index():
+    """Минимальный index.theme — без него загрузчик тему не признаёт."""
+    d = os.path.join(ICON_DIR, 'hicolor')
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, 'index.theme')
+    if os.path.exists(path):
+        return
+    with open(path, 'w') as f:
+        f.write(
+            '[Icon Theme]\n'
+            'Name=hicolor\n'
+            'Comment=autoswitch indicator icons\n'
+            'Directories=scalable/apps\n'
+            '\n'
+            '[scalable/apps]\n'
+            'Size=22\n'
+            'MinSize=8\n'
+            'MaxSize=512\n'
+            'Context=Applications\n'
+            'Type=Scalable\n'
+        )
+
+
+def _write_menu_dot(state, color):
+    """Кружок для пункта меню. Нужен там, где меню рисует панель:
+    DBusMenu выбрасывает разметку текста, но иконки пунктов передаёт,
+    поэтому цвет состояния показываем именно иконкой."""
+    os.makedirs(ICON_DIR, exist_ok=True)
+    path = os.path.join(ICON_DIR, f'autoswitch-menu-{state}.svg')
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+        'viewBox="0 0 16 16">\n'
+        f'  <circle cx="8" cy="8" r="5" fill="{color}"/>\n'
+        '</svg>\n'
+    )
+    with open(path, 'w') as f:
+        f.write(svg)
+    return path
+
+
+def _write_asc_logo():
+    """Цветные буквы asc для пункта настроек (тот же случай: DBusMenu)."""
+    os.makedirs(ICON_DIR, exist_ok=True)
+    path = os.path.join(ICON_DIR, 'autoswitch-asc.svg')
+    a, b, c = ASC_COLORS
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="16" '
+        'viewBox="0 0 30 16">\n'
+        f'  <text x="0"  y="13" font-family="sans-serif" font-size="14" '
+        f'font-weight="bold" fill="{a}">a</text>\n'
+        f'  <text x="10" y="13" font-family="sans-serif" font-size="14" '
+        f'font-weight="bold" fill="{b}">s</text>\n'
+        f'  <text x="20" y="13" font-family="sans-serif" font-size="14" '
+        f'font-weight="bold" fill="{c}">c</text>\n'
+        '</svg>\n'
+    )
+    with open(path, 'w') as f:
+        f.write(svg)
+    return path
+
+
+def _ensure_icons(prefs):
+    """Перегенерировать иконки статусов под текущие настройки."""
+    os.makedirs(THEME_DIR, exist_ok=True)
+    _write_theme_index()
+    for state, color in state_colors(prefs).items():
+        src = _write_icon(state, color, prefs['dot_size'])
+        # копия в структуру темы — оттуда её берёт AppIndicator
+        try:
+            with open(src) as f:
+                data = f.read()
+            with open(os.path.join(THEME_DIR, os.path.basename(src)), 'w') as f:
+                f.write(data)
+        except Exception:
+            pass
+        # копии в домашнюю тему — для панелей, которые IconThemePath не
+        # читают (LXQt). Имя содержит отпечаток цвета и размера: панель
+        # кеширует картинку по имени на всё время работы, и под старым
+        # именем отдавала бы прежний вид. Раз имя меняется вместе с
+        # содержимым, кеш всегда попадает в нужную картинку.
+        try:
+            os.makedirs(USER_ICON_DIR, exist_ok=True)
+            token = hashlib.md5(
+                f'{color}-{prefs["dot_size"]}'.encode()
+            ).hexdigest()[:8]
+            name = f'autoswitch-{state}-{token}'
+            with open(src) as f:
+                data = f.read()
+            with open(os.path.join(USER_ICON_DIR, name + '.svg'), 'w') as f:
+                f.write(data)
+            ICON_NAMES[state] = name
+            # прежние отпечатки этого состояния больше не нужны
+            for old in glob.glob(
+                os.path.join(USER_ICON_DIR, f'autoswitch-{state}-*.svg')
+            ):
+                if os.path.basename(old) != name + '.svg':
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        _write_menu_dot(state, color)
+    _write_asc_logo()
+    # тема закеширована при старте: без переучёта новые файлы не видны
+    try:
+        Gtk.IconTheme.get_default().rescan_if_needed()
+    except Exception:
+        pass
+
+
+# Минимальная ширина меню в пикселях: см. set_size_request ниже.
+# Меньше 206 ставить нельзя — столько занимает самая длинная строка
+# статуса («остановлен»). Если минимум окажется ниже, ширина снова начнёт
+# меняться вместе со статусом, и меню будет прыгать по горизонтали.
+MENU_MIN_W = 210
+
+MENU_CSS = b"""
+.autoswitch-menu separator {
+    background-color: alpha(currentColor, 0.22);
+    min-height: 1px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+}
+.autoswitch-menu menuitem {
+    padding-top: 5px;
+    padding-bottom: 5px;
+}
+"""
+
+
+def _apply_css():
+    """Стиль меню. Работает потому, что меню рисует GTK локально
+    (с AppIndicator/DBusMenu CSS не применялся бы вовсе)."""
+    try:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(MENU_CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+    except Exception:
+        pass
+
+
+class PrefsWindow(Gtk.Window):
+    """Настройки индикатора. Повторяет prefs.js GNOME-расширения.
+
+    На GNOME окно собрано на libadwaita (Adw.PreferencesPage). Для X11 её
+    брать нельзя — это GTK4, а мы на GTK3. Поэтому та же структура собрана
+    штатными средствами GTK3: описание, группа с ползунками, сброс.
+    """
+
+    def __init__(self, prefs, on_change):
+        super().__init__(title='Autoswitch')
+        self.prefs = dict(prefs)
+        self._on_change = on_change
+
+        self.set_default_size(460, -1)
+        self.set_resizable(False)
+        self.set_border_width(18)
+        # Своя иконка: та же плитка и шестерёнка, что у основной, но с
+        # камнем вместо букв. Иначе два окна программы в панели задач
+        # неразличимы — одинаковые иконка и заголовок.
+        try:
+            self.set_icon_name('autoswitch-indicator')
+        except Exception:
+            pass
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        self.add(box)
+
+        # ===== заголовок и описание =====
+        title = Gtk.Label()
+        title.set_markup('<big><b>%s</b></big>' % t('p_title'))
+        title.set_xalign(0.0)
+        box.pack_start(title, False, False, 0)
+
+        desc = Gtk.Label()
+        desc.set_markup('<span alpha="70%%">%s</span>'
+                        % GLib.markup_escape_text(t('p_about')))
+        desc.set_xalign(0.0)
+        desc.set_line_wrap(True)
+        desc.set_max_width_chars(52)
+        box.pack_start(desc, False, False, 0)
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # ===== группа «Индикатор» =====
+        grp = Gtk.Label()
+        grp.set_markup('<b>%s</b>' % t('p_group'))
+        grp.set_xalign(0.0)
+        box.pack_start(grp, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        box.pack_start(grid, False, False, 0)
+
+        self._scales = {}
+        self._add_row(grid, 0, 'dot_size',
+                      t('p_size'), t('p_size_d'))
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # ===== группа «Цвета состояний» =====
+        cgrp = Gtk.Label()
+        cgrp.set_markup('<b>%s</b>' % t('p_colors'))
+        cgrp.set_xalign(0.0)
+        box.pack_start(cgrp, False, False, 0)
+
+        chint = Gtk.Label()
+        chint.set_markup('<span alpha="65%%" size="small">%s</span>'
+                         % GLib.markup_escape_text(t('p_colors_d')))
+        chint.set_xalign(0.0)
+        box.pack_start(chint, False, False, 0)
+
+        # Подпись растягивается, кнопка цвета прижата к правому краю —
+        # как в настройках GNOME-расширения и апплета Plasma.
+        cgrid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        cgrid.set_column_homogeneous(False)
+        box.pack_start(cgrid, False, False, 0)
+
+        self._swatches = {}
+        self._add_color_row(cgrid, 0, 'color_running',
+                            t('p_running'), t('p_running_d'))
+        self._add_color_row(cgrid, 1, 'color_stopped',
+                            t('p_stopped'), t('p_stopped_d'))
+        self._add_color_row(cgrid, 2, 'color_error',
+                            t('p_error'), t('p_error_d'))
+
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # ===== сброс =====
+        rbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        rlbl = Gtk.Label()
+        rlbl.set_markup(
+            '%s\n<span alpha="65%%" size="small">%s</span>'
+            % (GLib.markup_escape_text(t('p_reset')),
+               GLib.markup_escape_text(t('p_reset_d')
+                                       % DEFAULTS['dot_size'])))
+        rlbl.set_xalign(0.0)
+        rbtn = Gtk.Button(label=t('p_reset_btn'))
+        rbtn.set_valign(Gtk.Align.CENTER)
+        rbtn.connect('clicked', self._on_reset)
+        rbox.pack_start(rlbl, True, True, 0)
+        rbox.pack_start(rbtn, False, False, 0)
+        box.pack_start(rbox, False, False, 0)
+
+    def _add_row(self, grid, row, key, title, subtitle):
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            f'{GLib.markup_escape_text(title)}\n'
+            f'<span alpha="65%" size="small">'
+            f'{GLib.markup_escape_text(subtitle)}</span>'
+        )
+        lbl.set_xalign(0.0)
+        lbl.set_valign(Gtk.Align.CENTER)
+
+        lo, hi = LIMITS[key]
+        adj = Gtk.Adjustment(lower=lo, upper=hi, step_increment=1,
+                             page_increment=1)
+        scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                          adjustment=adj)
+        scale.set_digits(0)
+        scale.set_draw_value(True)
+        scale.set_value_pos(Gtk.PositionType.RIGHT)
+        scale.set_size_request(220, -1)
+        scale.set_valign(Gtk.Align.CENTER)
+        scale.set_value(self.prefs[key])
+        scale.connect('value-changed', self._on_scale, key)
+
+        grid.attach(lbl, 0, row, 1, 1)
+        grid.attach(scale, 1, row, 1, 1)
+        self._scales[key] = scale
+
+    def _add_color_row(self, grid, row, key, title, subtitle):
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            f'{GLib.markup_escape_text(title)}\n'
+            f'<span alpha="65%" size="small">'
+            f'{GLib.markup_escape_text(subtitle)}</span>'
+        )
+        lbl.set_xalign(0.0)
+        lbl.set_valign(Gtk.Align.CENTER)
+
+        # Штатный GTK-выбор цвета, а не своя палитра: он уже умеет и сетку
+        # готовых оттенков, и произвольный цвет, и выглядит как остальные
+        # диалоги системы.
+        btn = Gtk.ColorButton()
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.set_title(title)
+        rgba = Gdk.RGBA()
+        rgba.parse(self.prefs.get(key, DEFAULTS[key]))
+        btn.set_rgba(rgba)
+        btn.connect('color-set', self._on_color, key)
+
+        lbl.set_hexpand(True)
+        btn.set_halign(Gtk.Align.END)
+        grid.attach(lbl, 0, row, 1, 1)
+        grid.attach(btn, 1, row, 1, 1)
+        self._swatches[key] = btn
+
+    def _on_color(self, widget, key):
+        c = widget.get_rgba()
+        self.prefs[key] = '#{:02x}{:02x}{:02x}'.format(
+            int(round(c.red * 255)),
+            int(round(c.green * 255)),
+            int(round(c.blue * 255)),
+        )
+        self._on_change(dict(self.prefs))
+
+    def _on_scale(self, widget, key):
+        self.prefs[key] = int(round(widget.get_value()))
+        self._on_change(dict(self.prefs))
+
+    def _on_reset(self, _btn):
+        self.prefs = dict(DEFAULTS)
+        for key, scale in self._scales.items():
+            scale.set_value(DEFAULTS[key])
+        for key, btn in self._swatches.items():
+            rgba = Gdk.RGBA()
+            rgba.parse(DEFAULTS[key])
+            btn.set_rgba(rgba)
+        self._on_change(dict(self.prefs))
+
+
+class AutoswitchTray:
+    def __init__(self):
+        self.prefs = load_prefs()
+        _ensure_icons(self.prefs)
+        self._state = 'unknown'
+        self._prefs_win = None
+
+        self.backend = _pick_backend()
+        # Меню рисуем силами GTK в обоих режимах: через DBusMenu разметка не
+        # проходит, поэтому панели отдаём заглушку из одного пункта, а наше
+        # цветное меню показываем сами по клику на нём.
+        self.rich = True
+
+        # --- значок в трее ---
+        self.icon = None
+        self.ind = None
+        self.sni = None
+        if self.backend == 'statusicon':
+            self.icon = Gtk.StatusIcon()
+            self.icon.set_title('Autoswitch')
+            self.icon.set_tooltip_text('Autoswitch')
+            self.icon.connect('popup-menu', self._on_popup)
+            self.icon.connect('activate', self._on_activate)
+        else:
+            # Сначала пробуем объявиться сами: тогда левый клик наш и
+            # заглушка в панельном меню не нужна.
+            #
+            # Наблюдателя StatusNotifierWatcher даёт панель, а она в
+            # автозапуске сессии поднимается не первой: индикатор часто
+            # оказывается на шине раньше, и регистрация падает. Раньше
+            # судьба решалась одной попыткой — значок уходил в libayatana
+            # со всеми её ограничениями, хотя через секунду панель уже
+            # работала. Отсюда «вчера меню открывалось сразу, сегодня
+            # через лишний пункт». Поэтому повторяем, а libayatana
+            # заводим, только если наблюдатель так и не появился.
+            try:
+                self.sni = SNIItem(
+                    APP_ID, 'Autoswitch', USER_ICON_DIR,
+                    on_activate=lambda x, y: self._popup_rich_menu(x, y),
+                    on_secondary=lambda x, y: self._popup_rich_menu(x, y),
+                    on_context=lambda x, y: self._popup_rich_menu(x, y),
+                )
+            except Exception:
+                self.sni = None
+            if self.sni is not None and not self.sni.ok:
+                self._sni_tries = 0
+                GLib.timeout_add_seconds(2, self._sni_retry)
+            elif self.sni is None:
+                self._fallback_appindicator()
+        self._set_tray_icon('unknown')
+
+        # --- меню (рисуется локально GTK, разметка и CSS работают) ---
+        self.menu = Gtk.Menu()
+        if self.rich:
+            _apply_css()
+            self.menu.get_style_context().add_class('autoswitch-menu')
+
+        # заголовок: жирный и яркий. Не гасим через set_sensitive(False) —
+        # тема притушила бы текст. Вместо этого снимаем подсветку при
+        # наведении, так пункт остаётся ярким и при этом «мёртвый».
+        if self.rich:
+            mi_title = self._markup_item('<b>Autoswitch</b>')
+            mi_title.connect('select', lambda w: w.deselect())
+        else:
+            # через DBusMenu разметка не проходит — только простой текст.
+            # Гасить пункт нельзя: панель рисует неактивные строки блёклыми
+            # и заодно обесцвечивает их иконки. Оставляем активным, просто
+            # не вешаем на него действие.
+            mi_title = Gtk.MenuItem(label='Autoswitch')
+        self.menu.append(mi_title)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # статус: одна строка текста, состояние окрашено — левый край
+        # ровняется со всеми пунктами меню
+        if self.rich:
+            self._item_status = self._markup_item(t('status') + ': …')
+            self._item_status.connect('select', lambda w: w.deselect())
+            self._status_label = self._item_status.get_child()
+        else:
+            # DBusMenu разметку выбрасывает, но иконку пункта передаёт —
+            # значит цвет состояния показываем кружком-иконкой слева
+            self._item_status = Gtk.ImageMenuItem(label=t('status') + ': …')
+            self._item_status.set_always_show_image(True)
+            self._status_icon_img = Gtk.Image()
+            self._item_status.set_image(self._status_icon_img)
+            # тоже не гасим — иначе кружок станет серым независимо от цвета
+            self._status_label = None
+        self.menu.append(self._item_status)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        mi_start = Gtk.MenuItem(label=t('start'))
+        self._mi_start = mi_start
+        mi_start.connect('activate', lambda w: self._svc('start'))
+        self.menu.append(mi_start)
+
+        mi_stop = Gtk.MenuItem(label=t('stop'))
+        self._mi_stop = mi_stop
+        mi_stop.connect('activate', lambda w: self._svc('stop'))
+        self.menu.append(mi_stop)
+
+        mi_restart = Gtk.MenuItem(label=t('restart'))
+        self._mi_restart = mi_restart
+        mi_restart.connect('activate', lambda w: self._svc('restart'))
+        self.menu.append(mi_restart)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        mi_prefs = Gtk.MenuItem(label=t('prefs'))
+        self._mi_prefs = mi_prefs
+        mi_prefs.connect('activate', lambda w: self._open_prefs())
+        self.menu.append(mi_prefs)
+
+        # «Настройки (asc)» — буквы цветные там, где цвет вообще доходит
+        if self.rich:
+            a, c_s, c_c = ASC_COLORS
+            asc = (f'<span foreground="{a}"><b>a</b></span>'
+                   f'<span foreground="{c_s}"><b>s</b></span>'
+                   f'<span foreground="{c_c}"><b>c</b></span>')
+            self._asc_markup = asc
+            mi_settings = self._markup_item(f"{t('settings')} ({asc})")
+            self._mi_settings_rich = mi_settings
+        else:
+            mi_settings = Gtk.ImageMenuItem(label=t('settings') + ' (asc)')
+            self._mi_settings_plain = mi_settings
+            mi_settings.set_always_show_image(True)
+            try:
+                asc_img = Gtk.Image()
+                asc_img.set_from_pixbuf(
+                    GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        os.path.join(ICON_DIR, 'autoswitch-asc.svg'), 30, 16
+                    )
+                )
+                mi_settings.set_image(asc_img)
+            except Exception:
+                pass
+        mi_settings.connect('activate', lambda w: self._open_asc())
+        self.menu.append(mi_settings)
+
+        # Минимальная ширина держит меню одного размера при любом
+        # статусе. Без неё «работает» и «остановлен» дают разную ширину,
+        # и меню прыгает по горизонтали от открытия к открытию: место
+        # якоря считается по ширине, запомненной с прошлого раза.
+        self.menu.set_size_request(MENU_MIN_W, -1)
+        self.menu.show_all()
+        self._menu_ready = True
+        # меню закрылось — уносим поверхность якоря, чтобы следующее
+        # открытие получило свежую и ничего не копилось
+        self.menu.connect('hide',
+                          lambda w: GLib.timeout_add(150, self._drop_anchor))
+        self._attach_stub_menu()
+
+        self._apply_visibility()
+        self._refresh()
+        GLib.timeout_add_seconds(3, self._refresh)
+        GLib.timeout_add_seconds(2, self._apply_visibility)
+
+    def _fallback_appindicator(self):
+        """Значок через libayatana — когда свой SNI не взлетел.
+
+        Панель в этом режиме показывает своё меню сама, поэтому ей
+        отдаётся заглушка из одного пункта, а наше цветное меню
+        поднимается уже из неё.
+        """
+        if self.ind is not None or _Ind is None:
+            return
+        self.ind = _Ind.Indicator.new(
+            APP_ID,
+            os.path.join(ICON_DIR, 'autoswitch-unknown.svg'),
+            _Ind.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.ind.set_icon_theme_path(ICON_DIR)
+        # иначе панель подписывает значок именем процесса
+        try:
+            self.ind.set_title('Autoswitch')
+        except Exception:
+            pass
+        self._attach_stub_menu()
+        self._set_tray_icon(self._state)
+        self._apply_visibility()
+
+    def _sni_retry(self):
+        """Ждём, пока панель объявит наблюдателя.
+
+        Тридцати секунд хватает на любой запуск сессии. Не дождались —
+        значит панель работает по-другому, переходим на libayatana.
+        """
+        if self.sni is None:
+            return False
+        self.sni._register()
+        if self.sni.ok:
+            self._set_tray_icon(self._state)
+            self._apply_visibility()
+            return False
+        self._sni_tries += 1
+        if self._sni_tries < 15:
+            return True
+        # Свой объект обязательно убираем с шины: иначе он объявится
+        # позже сам, и значков станет два.
+        try:
+            self.sni.dispose()
+        except Exception:
+            pass
+        self.sni = None
+        self._fallback_appindicator()
+        return False
+
+    @staticmethod
+    def _markup_item(markup):
+        """Пункт меню с Pango-разметкой, текст прижат влево."""
+        item = Gtk.MenuItem()
+        lbl = Gtk.Label()
+        lbl.set_use_markup(True)
+        lbl.set_markup(markup)
+        lbl.set_xalign(0.0)
+        item.add(lbl)
+        return item
+
+    def _attach_stub_menu(self):
+        """Отдать панели заглушку из одного пункта (только libayatana).
+
+        Она обязательно экспортирует меню, и панель показывает его сама —
+        метод Activate до нас не доходит. Пункт поднимает наше настоящее
+        меню. Со своим SNI заглушка не нужна: там клик приходит напрямую.
+        """
+        if self.ind is None or not getattr(self, '_menu_ready', False):
+            return
+        if getattr(self, 'stub_menu', None) is not None:
+            return
+        stub = Gtk.Menu()
+        mi_open = Gtk.MenuItem(label=t('open_menu'))
+        self._mi_open = mi_open
+        mi_open.connect("activate", lambda w: self._popup_rich_menu())
+        stub.append(mi_open)
+        stub.show_all()
+        self.stub_menu = stub
+        self.ind.set_menu(stub)
+        # средний клик панель отдаёт приложению напрямую — без лишнего шага
+        try:
+            self.ind.set_secondary_activate_target(mi_open)
+        except Exception:
+            pass
+
+    def _drop_anchor(self):
+        """Снести поверхность якоря.
+
+        Вызывается и перед каждым показом меню, и после его закрытия.
+        Постоянно живущий якорь копил состояние захвата ввода: меню
+        открывалось несколько раз подряд, а потом перестало насовсем —
+        фокус оставался за поверхностью, и всплывашку композитор уже не
+        признавал. Свежая поверхность на каждое открытие копить нечему.
+        """
+        win = getattr(self, '_anchor_win', None)
+        self._anchor_win = None
+        self._anchor_box = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        return False
+
+    def _get_anchor(self, x, y, at_top=True):
+        """Свежее окно-невидимка под значком — родитель для меню.
+
+        Всплывающее окно на Wayland обязано быть прицеплено к обычному
+        окну, которое уже на экране. Своего окна у индикатора нет,
+        поэтому заводим пустое 1x1 и ставим под значок. Окно объявлено
+        слоевой поверхностью: в раскладку композитора не попадает и
+        соседние окна не двигает.
+
+        Возвращает виджет, к которому цепляется меню, или None.
+        """
+        if _LS is None:
+            return None
+        self._drop_anchor()
+
+        win = Gtk.Window()
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_default_size(1, 1)
+        win.set_size_request(1, 1)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual is not None:
+            win.set_visual(visual)
+        win.connect('draw', self._clear_anchor_bg)
+
+        _LS.init_for_window(win)
+        # тот же слой, где живут панели и их меню
+        _LS.set_layer(win, _LS.Layer.OVERLAY)
+        # ON_DEMAND: якорь получает фокус, когда его запрашивает всплывшее
+        # из него меню. Без этого права меню живёт лишь пока в системе
+        # вообще нет активного окна: стоит любому чужому окну взять фокус
+        # (например, открытому из этого же меню asc-gui), и композитор
+        # снимает всплывашку неактивной поверхности сразу.
+        _LS.set_keyboard_mode(win, _LS.KeyboardMode.ON_DEMAND)
+
+        # Горизонталь — координата значка, её присылает панель с кликом.
+        _LS.set_anchor(win, _LS.Edge.LEFT, True)
+        _LS.set_margin(win, _LS.Edge.LEFT, max(0, int(x)))
+
+        # А по вертикали отступ не задаём вовсе. Панель резервирует под
+        # себя место тем же протоколом layer-shell, и при нулевом отступе
+        # композитор сам поставит якорь сразу ЗА панелью — он знает её
+        # высоту точно, а мы бы гадали.
+        _LS.set_anchor(win, _LS.Edge.TOP, at_top)
+        _LS.set_anchor(win, _LS.Edge.BOTTOM, not at_top)
+        _LS.set_margin(win, _LS.Edge.TOP, 0)
+        _LS.set_margin(win, _LS.Edge.BOTTOM, 0)
+
+        box = Gtk.Box()
+        box.set_size_request(1, 1)
+        win.add(box)
+        self._anchor_win = win
+        self._anchor_box = box
+        win.show_all()
+        return box
+
+    @staticmethod
+    def _clear_anchor_bg(_widget, cr):
+        """Стереть фон якоря в прозрачность, иначе тема нарисует свой."""
+        try:
+            import cairo
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+        except Exception:
+            cr.set_operator(1)  # cairo.OPERATOR_SOURCE
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        return False
+
+    def _hide_anchor(self):
+        win = getattr(self, '_anchor_win', None)
+        if win is not None:
+            try:
+                win.hide()
+            except Exception:
+                pass
+
+    def _popup_rich_menu(self, icon_x=None, icon_y=None):
+        """Показать наше меню над панелью.
+
+        Если панель прислала координаты значка (свой SNI так и делает),
+        ставим меню по центру значка. Иначе берём точку у курсора — так
+        работает libayatana, где клик до нас доходит только через заглушку.
+        """
+        try:
+            self._refresh()
+        except Exception:
+            pass
+        # Повторный клик по значку: GTK считает меню всё ещё открытым, и
+        # новый показ уходит в никуда. Раньше это выглядело как «один раз
+        # сработало, а дальше не открывается». Сначала закрываем.
+        try:
+            self.menu.popdown()
+        except Exception:
+            pass
+        if self._is_wayland() and self._popup_wayland(icon_x, icon_y):
+            return
+        try:
+            display = Gdk.Display.get_default()
+            seat = display.get_default_seat()
+            _scr, px, py = seat.get_pointer().get_position()
+            x = icon_x if icon_x else px
+            y = icon_y if icon_y else py
+            mon = display.get_monitor_at_point(x, y)
+            wa = mon.get_workarea()
+            root = Gdk.get_default_root_window()
+            rect = Gdk.Rectangle()
+            rect.x, rect.width, rect.height = x, 1, 1
+            edge = _panel_edge(x, y, wa)
+            gap = 6  # как отступ меню от панели в GNOME
+            # Координаты значка есть — центрируем меню по нему. Без них
+            # прижимаем левым краем к точке, иначе меню уедет под курсор.
+            horiz = (Gdk.Gravity.NORTH if icon_x else Gdk.Gravity.NORTH_WEST)
+            if edge is not None and edge[0] == 'bottom':
+                rect.y = edge[1] - gap
+                menu_grav = (Gdk.Gravity.SOUTH if icon_x
+                             else Gdk.Gravity.SOUTH_WEST)
+            elif edge is not None:
+                rect.y = edge[1] + gap
+                menu_grav = horiz
+            else:
+                rect.y = y
+                menu_grav = horiz
+            self.menu.popup_at_rect(
+                root, rect,
+                Gdk.Gravity.NORTH_WEST, menu_grav, None
+            )
+        except Exception:
+            self.menu.popup_at_pointer(None)
+
+    @staticmethod
+    def _is_wayland():
+        try:
+            return 'Wayland' in type(Gdk.Display.get_default()).__name__
+        except Exception:
+            return False
+
+    def _popup_wayland(self, icon_x=None, icon_y=None):
+        """Показать меню, прицепив его к окну-якорю.
+
+        Путь через корневое окно тут не годится: на Wayland корневого
+        окна нет вовсе, а показ у курсора требует настоящего события
+        ввода — клик же приходит по D-Bus. Без родителя меню либо не
+        появлялось совсем, либо выводилось отдельным окном посреди
+        экрана. Возвращает True, если показали.
+        """
+        try:
+            x, y = icon_x, icon_y
+            if not x or not y:
+                seat = Gdk.Display.get_default().get_default_seat()
+                _scr, x, y = seat.get_pointer().get_position()
+            x, y = int(x), int(y)
+
+            geo = None
+            try:
+                mon = Gdk.Display.get_default().get_monitor_at_point(x, y)
+                geo = mon.get_geometry()
+            except Exception:
+                geo = None
+
+            # Панель сверху или снизу — узнаём по тому, в какой половине
+            # экрана оказался значок.
+            at_top = True
+            if geo is not None:
+                at_top = (y - geo.y) < geo.height / 2
+
+            # Сторону раскрытия считаем по ФАКТИЧЕСКОЙ ширине меню, а не
+            # по половине экрана: только так оно не уедет за край при
+            # любом положении значка и любой длине пунктов.
+            # Ширина меню. Отрисовывать его заранее НЕЛЬЗЯ: realize()
+            # создаёт окно меню до того, как назначен родитель, и
+            # прицепить его к якорю потом уже невозможно — меню выводится
+            # отдельным окном посреди экрана. Поэтому ширину берём ту,
+            # что запомнили после прошлого показа, а до первого показа
+            # обходимся положением значка.
+            menu_w = getattr(self, '_menu_w', 0)
+            try:
+                _minw, w = self.menu.get_preferred_width()
+                # ноль и единица — одинаковый мусор от неотрисованного
+                # меню; настоящая ширина всегда заметно больше
+                if w > 20:
+                    menu_w = w
+            except Exception:
+                pass
+
+            # Эффективная ширина: замер бывает меньше настоящей (меню не
+            # отрисовано), поэтому не даём ей опускаться ниже минимума.
+            eff_w = max(menu_w, MENU_MIN_W)
+
+            to_left = False
+            try:
+                if geo is not None:
+                    to_left = (x + eff_w) > (geo.x + geo.width)
+            except Exception:
+                pass
+
+            # Гравитацию меню wlroots не соблюдает: меню всегда строится
+            # ВПРАВО от точки привязки, сколько ни задавай NORTH_EAST.
+            # Поэтому не спорим с ней, а двигаем сам якорь: чтобы меню
+            # закончилось под значком, ставим якорь левее на его ширину.
+            anchor_x = x
+            if geo is not None:
+                if to_left:
+                    anchor_x = x - eff_w
+                # и в любом случае не дальше, чем позволяет ширина меню
+                anchor_x = max(0, min(anchor_x, geo.width - eff_w))
+
+            a_grav = (Gdk.Gravity.SOUTH_WEST if at_top
+                      else Gdk.Gravity.NORTH_WEST)
+            m_grav = (Gdk.Gravity.NORTH_WEST if at_top
+                      else Gdk.Gravity.SOUTH_WEST)
+
+            box = self._get_anchor(anchor_x, y, at_top)
+            if box is None:
+                return False
+
+            shown = []
+
+            def show():
+                # показываем ровно один раз: пришло событие появления
+                # или сработала страховка — что раньше
+                if shown:
+                    return False
+                shown.append(1)
+                self.menu.popup_at_widget(box, a_grav, m_grav, None)
+                # запоминаем настоящую ширину — со следующего раза
+                # сторону раскрытия посчитаем точно, а не на глаз
+                try:
+                    aw = self.menu.get_allocated_width()
+                    # только вверх: если запомнить меньшее значение,
+                    # следующее открытие уедет влево
+                    if aw > 20:
+                        self._menu_w = max(getattr(self, '_menu_w', 0), aw)
+                except Exception:
+                    pass
+                return False
+
+            # Цепляем меню только после того, как поверхность якоря
+            # оказалась на экране: пока её нет, привязывать не к чему.
+            # Страховочный таймер нужен на случай, если событие появления
+            # не придёт — без него меню молча не открылось бы вовсе.
+            win = self._anchor_win
+            win.connect('map-event',
+                        lambda *_a: (GLib.timeout_add(30, show), False)[1])
+            GLib.timeout_add(250, show)
+            return True
+        except Exception:
+            return False
+
+    def _set_tray_icon(self, state):
+        """Индикатор в трее нужного цвета."""
+        try:
+            if self.icon is not None:
+                # сохраняем пропорции: с отступами холст шире, чем выше
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    os.path.join(ICON_DIR, f'autoswitch-{state}.svg'),
+                    -1, 22, True
+                )
+                self.icon.set_from_pixbuf(pb)
+            elif self.sni is not None:
+                # свой SNI получает путь — он отдаст панели пиксели
+                self.sni.set_icon(
+                    os.path.join(ICON_DIR, f'autoswitch-{state}.svg')
+                )
+            elif self.ind is not None:
+                self.ind.set_icon_full(
+                    ICON_NAMES.get(state, f'autoswitch-{state}'), 'autoswitch'
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _position_menu(menu, x, y, icon):
+        """Меню по центру значка, вверх или вниз — смотря где панель.
+
+        Штатная Gtk.StatusIcon.position_menu прижимает меню к краю экрана.
+        Здесь центр меню совмещается с центром значка, а сторона выбирается
+        по положению значка на мониторе: значок сверху — меню вниз, и наоборот.
+        """
+        ok, screen, area, orientation = icon.get_geometry()
+        if not ok:
+            return (x, y, True)
+
+        # без realize GTK отдаёт размер до раскладки — меню уезжает вбок
+        if not menu.get_realized():
+            menu.realize()
+        mw = max(menu.get_preferred_width()[1], menu.get_allocated_width())
+        mh = max(menu.get_preferred_height()[1], menu.get_allocated_height())
+
+        # рабочая область монитора, на котором находится значок
+        try:
+            monitor = screen.get_display().get_monitor_at_point(
+                area.x + area.width // 2, area.y + area.height // 2
+            )
+            work = monitor.get_workarea()
+        except Exception:
+            work = None
+
+        mx = area.x + area.width // 2 - mw // 2
+
+        if work is not None:
+            # панель сверху, если значок выше середины монитора
+            if area.y + area.height // 2 < work.y + work.height // 2:
+                my = area.y + area.height
+            else:
+                my = area.y - mh
+            # не выпускать меню за края экрана
+            mx = max(work.x, min(mx, work.x + work.width - mw))
+            my = max(work.y, min(my, work.y + work.height - mh))
+        else:
+            my = area.y + area.height
+
+        return (mx, my, False)
+
+    def _popup(self, button, time):
+        self.menu.popup(None, None, self._position_menu,
+                        self.icon, button, time)
+
+    def _on_popup(self, icon, button, time):
+        self._popup(button, time)
+
+    def _on_activate(self, icon):
+        self._popup(1, Gtk.get_current_event_time())
+
+    def _apply_visibility(self):
+        """Показать или скрыть значок по флагу show_indicator в конфиге."""
+        on = _indicator_enabled()
+        if self.icon is not None:
+            self.icon.set_visible(on)
+        elif self.sni is not None:
+            self.sni.set_status(on)
+        elif self.ind is not None:
+            self.ind.set_status(
+                _Ind.IndicatorStatus.ACTIVE if on
+                else _Ind.IndicatorStatus.PASSIVE
+            )
+        return True
+
+    def _set_state(self, state):
+        if state != self._state:
+            self._state = state
+            self._set_tray_icon(state)
+        word = {
+            'running': t('running'),
+            'stopped': t('stopped'),
+            'error':   t('error'),
+            'unknown': '…',
+        }.get(state, '…')
+        if self.rich:
+            # слово состояния в меню красим тем же цветом, что и индикатор
+            color = state_colors(self.prefs).get(state, COLORS['unknown'])
+            color = _text_color(color)
+            # само состояние окрашено, как в GNOME-меню
+            self._status_label.set_markup(
+                f"{t('status')}: "
+                f'<span foreground="{color}"><b>'
+                f'{GLib.markup_escape_text(word)}'
+                '</b></span>'
+            )
+        else:
+            # текст без цвета, цвет несёт иконка пункта
+            self._item_status.set_label('%s: %s' % (t('status'), word))
+            try:
+                self._status_icon_img.set_from_pixbuf(
+                    GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        os.path.join(ICON_DIR, f'autoswitch-menu-{state}.svg'),
+                        16, 16
+                    )
+                )
+            except Exception:
+                pass
+
+    def _relang(self):
+        """Перерисовать подписи меню под новый ui_lang, без перезапуска."""
+        pairs = [('_mi_start', 'start'), ('_mi_stop', 'stop'),
+                 ('_mi_restart', 'restart'), ('_mi_prefs', 'prefs'),
+                 ('_mi_open', 'open_menu')]
+        for attr, key in pairs:
+            it = getattr(self, attr, None)
+            if it is not None:
+                try:
+                    it.set_label(t(key))
+                except Exception:
+                    pass
+        it = getattr(self, '_mi_settings_plain', None)
+        if it is not None:
+            try:
+                it.set_label(t('settings') + ' (asc)')
+            except Exception:
+                pass
+        if self.rich and getattr(self, '_mi_settings_rich', None) is not None:
+            try:
+                self._mi_settings_rich.get_child().set_markup(
+                    f"{t('settings')} ({self._asc_markup})")
+            except Exception:
+                pass
+        # слово состояния перерисуется в _set_state — вызываем принудительно,
+        # иначе «Статус: работает» останется на прежнем языке до смены статуса
+        try:
+            self._set_state(self._state)
+        except Exception:
+            pass
+
+    def _refresh(self):
+        lang = _ui_lang()
+        if lang != getattr(self, '_lang', None):
+            self._lang = lang
+            self._relang()
+        try:
+            out = subprocess.run(
+                ['systemctl', 'is-active', SERVICE],
+                capture_output=True, text=True, timeout=2,
+            )
+            s = (out.stdout or '').strip()
+            if s == 'active':
+                self._set_state('running')
+            elif s == 'failed':
+                self._set_state('error')
+            else:
+                self._set_state('stopped')
+        except Exception:
+            self._set_state('unknown')
+        return True  # продолжать таймер
+
+    def _svc(self, action):
+        try:
+            # Гасим ДО запуска команды и только для restart и stop: у
+            # start цвет и так сменится на зелёный, лишний мазок не нужен.
+            if action in ('restart', 'stop'):
+                self._blink()
+            # через единый asc-helper (polkit без пароля), а не прямой
+            # systemctl — у индикатора нет прав root напрямую
+            subprocess.Popen(['pkexec', '/usr/local/bin/asc-helper',
+                              'service', action])
+            GLib.timeout_add(600, self._refresh_once)
+        except Exception:
+            pass
+
+    def _blink(self):
+        """Показать промежуточное состояние самим и уточнить через момент.
+
+        Перезапуск службы занимает доли секунды: если просто подождать и
+        опросить, она уже снова работает — цвет не меняется, и кажется,
+        что команда не сработала. Так же сделано в расширении GNOME и в
+        плазмоиде: вид у всех трёх должен быть один.
+
+        Меняем именно состояние, а не только картинку — тогда и надпись в
+        меню показывает «остановлен», как у остальных.
+        """
+        try:
+            self._set_state('stopped')
+        except Exception:
+            pass
+        GLib.timeout_add(600, self._refresh_once)
+
+    def _refresh_once(self):
+        self._refresh()
+        return False
+
+    def attach_ipc(self, srv):
+        """Слушаем сокет: повторный запуск просит открыть настройки,
+        а asc/asc-gui — сразу обновить состояние после перезапуска службы
+        (иначе индикатор узнал бы о нём только со следующим опросом)."""
+        self._ipc = srv
+        GLib.io_add_watch(srv.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                          self._on_ipc)
+
+    def _on_ipc(self, *_a):
+        try:
+            conn, _addr = self._ipc.accept()
+            cmd = (conn.recv(64) or b'').decode('utf-8', 'replace').strip()
+            conn.close()
+        except Exception:
+            return True
+        try:
+            if cmd == 'refresh':
+                # Стучится asc или asc-gui: там добавили исключение,
+                # правили конфиг или трогали службу. Показываем это сразу,
+                # не дожидаясь планового опроса, и мигаем — чтобы было
+                # видно, что действие применилось.
+                self._blink()
+            else:
+                self._open_prefs()
+        except Exception:
+            pass
+        return True
+
+    def _open_prefs(self):
+        """Окно настроек индикатора (аналог prefs.js на GNOME)."""
+        if self._prefs_win is not None:
+            self._prefs_win.present()
+            return
+        self._prefs_win = PrefsWindow(self.prefs, self._apply_prefs)
+        self._prefs_win.connect(
+            'destroy', lambda w: setattr(self, '_prefs_win', None)
+        )
+        self._prefs_win.show_all()
+
+    def _apply_prefs(self, prefs):
+        """Применить настройки на лету: перерисовать значок."""
+        self.prefs = prefs
+        save_prefs(prefs)
+        _ensure_icons(prefs)
+        self._set_tray_icon(self._state)
+
+    def _open_asc(self):
+        # Сначала графический asc-gui, и только если его нет — консольный
+        # asc в терминале. Ищем по абсолютному пути: индикатор стартует из
+        # автозапуска сессии, где PATH урезан и /usr/local/bin в него часто
+        # не входит. По одному имени запуск падал, и вместо окна открывался
+        # терминал, хотя asc-gui в системе есть.
+        gui = shutil.which('asc-gui')
+        if not gui:
+            for p in ('/usr/local/bin/asc-gui', '/usr/bin/asc-gui'):
+                if os.path.exists(p):
+                    gui = p
+                    break
+        if gui:
+            try:
+                subprocess.Popen([gui])
+                return
+            except Exception:
+                pass
+        for term in (
+            ['x-terminal-emulator', '-e', 'bash', '-lc', 'asc'],
+            ['xterm', '-e', 'bash', '-lc', 'asc'],
+            ['qterminal', '-e', 'bash', '-lc', 'asc'],
+            ['xfce4-terminal', '-x', 'bash', '-lc', 'asc'],
+            ['konsole', '-e', 'bash', '-lc', 'asc'],
+        ):
+            try:
+                subprocess.Popen(term)
+                return
+            except Exception:
+                continue
+
+
+def _sock_path():
+    return os.path.join(GLib.get_user_runtime_dir() or '/tmp',
+                        'autoswitch-indicator.sock')
+
+
+def _single_instance():
+    """Один индикатор на пользователя.
+
+    Держим unix-сокет в runtime-каталоге. Если он уже кем-то слушается —
+    значит индикатор работает: просим его открыть окно настроек и
+    выходим. Раньше второй запуск завершался молча, и щелчок по пункту
+    меню выглядел так, будто ничего не происходит.
+    """
+    path = _sock_path()
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(path)
+        probe.sendall(b'prefs')
+        return None
+    except OSError:
+        pass
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+    # сокет остался от упавшего процесса — убираем и занимаем сами
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(5)
+        srv.setblocking(False)
+    except OSError:
+        return None
+    atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+    return srv
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    srv = _single_instance()
+    if srv is None:
+        # уже запущен — окно настроек откроет работающий экземпляр
+        sys.exit(0)
+    tray = AutoswitchTray()
+    tray.attach_ipc(srv)
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

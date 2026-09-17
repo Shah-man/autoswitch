@@ -1,0 +1,1907 @@
+#!/usr/bin/env bash
+# asc — autoswitch control. Bilingual (RU/EN) dialog interface.
+# Navigation: Enter — select, ESC — back.
+#
+#   asc                 menu
+#   asc start|stop|restart|status
+#   asc enable|disable  autostart
+#   asc config          settings
+#   asc log             journal
+
+set -u
+
+SERVICE="autoswitch"
+CONFIG="/etc/autoswitch/config"
+UW="/etc/autoswitch/user_words.txt"
+LEARNED="/etc/autoswitch/learned.txt"
+
+# --- словарь: US-форма против читаемого вида ---------------------------
+# Ключ в learned.txt хранится в US-форме (латинскими клавишами): он должен
+# совпадать с тем, что реально приходит с клавиатуры. Человеку же слово
+# показываем так, как оно выглядит на экране: запись `bltt ru` — это «идее».
+# Таблицы взяты из asc-gui намеренно: вид в консоли и в окне обязан
+# совпадать, иначе одно и то же слово выглядит в двух местах по-разному.
+_PY_KB='
+KB_US = "qwertyuiop[]asdfghjkl;\x27zxcvbnm,./`"
+KB_RU = "йцукенгшщзхъфывапролджэячсмитьбю.ё"
+US2RU = dict(zip(KB_US, KB_RU))
+RU2US = dict(zip(KB_RU, KB_US))
+'
+
+# слово в любой раскладке -> US-форма (для записи в файл)
+learned_to_us() {
+    python3 -c "$_PY_KB"'
+import sys
+print("".join(RU2US.get(c, c) for c in sys.argv[1].lower()))
+' "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# Показать словарь читаемо. Второй аргумент "plain" — без отступов и
+# выравнивания, пригодный для правки в редакторе.
+learned_show() {
+    python3 -c "$_PY_KB"'
+import sys
+plain = len(sys.argv) > 2 and sys.argv[2] == "plain"
+rows = []
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.replace("\t", " ").split()
+            if not parts:
+                continue
+            form = parts[0]
+            lang = parts[1].lower() if len(parts) > 1 else "us"
+            if lang not in ("ru", "us"):
+                lang = "us"
+            word = ("".join(US2RU.get(c, c) for c in form.lower())
+                    if lang == "ru" else form.lower())
+            rows.append((word, lang))
+except OSError:
+    pass
+width = max([len(r[0]) for r in rows] + [0])
+# Порядок не меняем: показываем как лежит в файле — так же делает окно
+# asc-gui. Сортировка ставила латиницу раньше кириллицы, и один и тот же
+# словарь выглядел в консоли и в окне по-разному.
+for word, lang in rows:
+    if plain:
+        print("%s %s" % (word, lang))
+    else:
+        print("  %-*s  %s" % (width, word, lang))
+' "$1" "${2:-}" 2>/dev/null
+}
+
+# Читаемый файл -> US-форма на stdout (для записи через asc-helper).
+learned_to_file() {
+    python3 -c "$_PY_KB"'
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.replace("\t", " ").split()
+            if not parts:
+                continue
+            word = parts[0]
+            lang = parts[1].lower() if len(parts) > 1 else "us"
+            if lang not in ("ru", "us"):
+                lang = "us"
+            us = "".join(RU2US.get(c, c) for c in word.lower())
+            print("%s\t%s" % (us, lang))
+except OSError:
+    pass
+' "$1" 2>/dev/null
+}
+
+# Правка словаря в человеческом виде — как в окне asc-gui.
+# Прямая правка learned.txt не годится: там лежит US-форма, и слово
+# «идее» выглядит как «bltt» — пользователь не понимает, что правит.
+# Поэтому отдаём редактору читаемую копию с той же подсказкой, что в
+# окне, а на выходе переводим обратно и записываем тем же помощником —
+# нормализация формата остаётся в одном месте.
+learned_edit() {
+    local tmp helper
+    tmp="$(mktemp)" || return 1
+    {
+        # В окне абзац-пояснение стоит над полем правки. В редакторе
+        # отдельной области нет, поэтому кладём его теми же словами, но
+        # комментарием — при чтении строки с # всё равно отбрасываются.
+        # перенос делаем питоном: fold считает БАЙТЫ, а кириллица
+        # многобайтовая — строки выходили вдвое короче нужного
+        printf '%b' "$(t td_hint)" | python3 -c 'import sys, textwrap
+t = sys.stdin.read().strip()
+for ln in textwrap.wrap(t, 72) or [""]:
+    print("# " + ln)'
+        echo
+        printf '%b\n\n' "$(t td_file_hint)"
+        learned_show "$LEARNED" plain
+    } > "$tmp"
+    "$EDITOR_BIN" "$tmp"
+    helper="$(command -v asc-helper 2>/dev/null || echo /usr/local/bin/asc-helper)"
+    if [ -x "$helper" ]; then
+        learned_to_file "$tmp" | "$helper" write-learned
+    else
+        { echo "# autoswitch: мой словарь (US-форма<TAB>ru|us)."
+          learned_to_file "$tmp"; } > "$LEARNED"
+    fi
+    rm -f "$tmp"
+}
+# Домашняя папка ТОГО, КТО ЗАПУСТИЛ, а не root: asc перезапускает себя
+# через sudo, и $HOME становится /root. Из-за этого журнал искали в
+# /root/Applications — там его нет и быть не может, служба пишет его в
+# домашнюю папку пользователя. Определяется один раз, здесь, потому что
+# путь нужен и до получения прав, и после.
+user_home() {
+    local h=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        h="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    elif [ -n "${PKEXEC_UID:-}" ]; then
+        h="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f6)"
+    else
+        h="$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6)"
+    fi
+    [ -n "$h" ] || h="$HOME"
+    printf '%s' "$h"
+}
+
+# Журнал рядом с исходниками, в домашней папке — доступен без sudo.
+LOGFILE="$(user_home)/Applications/autoswitch.logs/autoswitch.log"
+
+# Сказать индикатору обновиться сразу после действий со службой: он
+# опрашивает состояние раз в несколько секунд и иначе показал бы перезапуск
+# с задержкой. Если индикатор не запущен — тихо ничего не делаем.
+poke_indicator() {
+    # маячок для GNOME-расширения: оно следит за этим файлом и показывает
+    # перезапуск в панели (напрямую до расширения не достучаться)
+    : > "${XDG_RUNTIME_DIR:-/tmp}/autoswitch.beacon" 2>/dev/null || true
+    _sock="${XDG_RUNTIME_DIR:-/tmp}/autoswitch-indicator.sock"
+    [ -S "$_sock" ] || return 0
+    printf 'refresh' | timeout 1 socat - "UNIX-CONNECT:$_sock" 2>/dev/null \
+        || python3 -c "
+import socket,sys
+try:
+    c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); c.settimeout(0.5)
+    c.connect('$_sock'); c.sendall(b'refresh'); c.close()
+except Exception: pass" 2>/dev/null
+    return 0
+}
+EDITOR_BIN="${EDITOR:-nano}"
+
+export ESCDELAY=50
+DIALOG_BIN="${DIALOG:-dialog}"
+DIALOG=dlg   # обёртка, см. ниже: перед каждым меню возвращаемся на свой экран
+BACKTITLE="autoswitch — asc"
+# В своём окне (asc-term) размер шрифта меняется горячими клавишами —
+# подсказываем это в шапке. В чужом терминале не пишем: там свои сочетания.
+[ -n "${ASC_TERM_OWN:-}" ] && \
+    BACKTITLE="autoswitch — asc      Ctrl+ крупнее   Ctrl- мельче   Ctrl 0 сброс"
+
+# ---------- язык интерфейса ----------
+# из конфига (ui_lang=ru|en); по умолчанию — системная локаль
+UI_LANG="$(grep -E '^ui_lang=' "$CONFIG" 2>/dev/null | cut -d= -f2)"
+if [ -z "$UI_LANG" ]; then
+    case "${LANG:-}" in
+        ru*|RU*) UI_LANG="ru" ;;
+        *)       UI_LANG="en" ;;
+    esac
+fi
+[ "$UI_LANG" = "ru" ] || UI_LANG="en"
+
+# словарь строк: t <key>
+t() {
+    local k="$1"
+    if [ "$UI_LANG" = "ru" ]; then
+        case "$k" in
+            title_main)   echo "Autoswitch" ;;
+            select)       echo "Выбрать" ;;
+            exit)         echo "Выход" ;;
+            back)         echo "Назад" ;;
+            yes)          echo "Да" ;;
+            no)           echo "Нет" ;;
+            cancel)       echo "Отмена" ;;
+            ok)           echo "OK" ;;
+            add)          echo "Добавить" ;;
+            state)        echo "Состояние" ;;
+            autostart)    echo "Автозапуск" ;;
+            running)      echo "работает" ;;
+            stopped)      echo "остановлен" ;;
+            on)           echo "вкл" ;;
+            off)          echo "выкл" ;;
+            m_start)      echo "Запустить" ;;
+            m_stop)       echo "Остановить" ;;
+            m_restart)    echo "Перезапустить" ;;
+            m_autostart)  echo "Автозапуск" ;;
+            m_settings)   echo "Настройки" ;;
+            m_status)     echo "Статус" ;;
+            m_log)        echo "Журнал (лог)" ;;
+            m_manual)     echo "Руководство" ;;
+            man_read)     echo "Читать" ;;
+            man_save)     echo "Сохранить в файл" ;;
+            man_where)    echo "Куда сохранить руководство?" ;;
+            man_ok)       echo "Сохранено: %s" ;;
+            man_err)      echo "Не удалось записать файл." ;;
+            m_techdict)   echo "Мой словарь" ;;
+            r_starting)   echo "Запуск autoswitch" ;;
+            r_stopping)   echo "Остановка autoswitch" ;;
+            r_restarting) echo "Перезапуск autoswitch" ;;
+            svc_running)  echo "● Служба РАБОТАЕТ" ;;
+            svc_stopped)  echo "○ Служба ОСТАНОВЛЕНА" ;;
+            details)      echo "подробности" ;;
+            press_back)   echo "ESC или Enter — назад..." ;;
+            view_hint)    echo "ESC и Enter — назад" ;;
+            log_view)     echo "Журнал (лог)" ;;
+            log_save)     echo "Сохранить в файл" ;;
+            cfg_saved_restarted) echo "Сохранено, служба перезапущена" ;;
+            cfg_unchanged) echo "Изменений нет" ;;
+            log_clear)    echo "Очистить журнал" ;;
+            log_clear_t)  echo "Очистить журнал?" ;;
+            log_clear_q)  echo "Журнал autoswitch будет очищен безвозвратно.\n\nЛоги сохраняются в файл по пути:\n~/Applications/autoswitch.logs/autoswitch.log\n\nПродолжить?" ;;
+            log_cleared)  echo "Журнал очищен" ;;
+            log_none)     echo "Журнал пуст.\n\nФайл: $LOGFILE\n\nЗаписи появятся после первого запуска службы. Если служба работает, а журнал пуст — проверьте настройку log_max_size." ;;
+            log_save_note) echo "Будет сохранён весь журнал службы за всё время.\n\nВыбрать папку?" ;;
+            log_where)    echo "Куда сохранить:" ;;
+            dir_default)  echo "Рядом с программой (Applications)" ;;
+            dir_home)     echo "Домашняя папка" ;;
+            dir_downloads) echo "Загрузки" ;;
+            dir_documents) echo "Документы" ;;
+            dir_other)    echo "Другая папка..." ;;
+            dir_ask)      echo "Путь к папке:" ;;
+            dir_confirm)  echo "Сохранить журнал в папку:" ;;
+            log_saved)    echo "Журнал сохранён" ;;
+            as_title)     echo "Автозапуск" ;;
+            as_now_on)    echo "сейчас: включён" ;;
+            as_now_off)   echo "сейчас: выключен" ;;
+            as_enable)    echo "Включить" ;;
+            as_disable)   echo "Выключить" ;;
+            as_on_done)   echo "Автозапуск включён" ;;
+            as_off_done)  echo "Автозапуск выключен" ;;
+            set_title)    echo "Настройки" ;;
+            set_config)   echo "Редактировать конфиг" ;;
+            set_export)   echo "Экспорт настроек" ;;
+            set_import)   echo "Импорт настроек" ;;
+            exp_t)        echo "Экспорт настроек" ;;
+            exp_p)        echo "Куда сохранить файл переноса?\nВ нём будут настройки и «Мой словарь»." ;;
+            exp_ok)       echo "Сохранено: %s" ;;
+            exp_err)      echo "Не удалось записать файл." ;;
+            imp_t)        echo "Импорт настроек" ;;
+            imp_p)        echo "Путь к файлу переноса:" ;;
+            imp_bad)      echo "Это не файл переноса настроек autoswitch." ;;
+            imp_ask)      echo "Настройки будут заменены содержимым файла.\n«Мой словарь» дополнится: слова из файла имеют приоритет.\n\nПродолжить?" ;;
+            imp_ok)       echo "Импортировано. Слов в словаре: %s" ;;
+            set_lang)     echo "Язык / Language" ;;
+            set_excl)     echo "Исключения приложений" ;;
+            set_indicator) echo "Индикатор в панели" ;;
+            ind_title)    echo "Индикатор в панели" ;;
+            ind_now)      echo "Сейчас" ;;
+            ind_on)       echo "Показывать индикатор" ;;
+            ind_off)      echo "Скрыть индикатор" ;;
+            ind_on_done)  echo "Индикатор включён" ;;
+            ind_off_done) echo "Индикатор скрыт" ;;
+            ind_hint)     echo "Цветной индикатор статуса в системной панели. Работе autoswitch не мешает — это только значок." ;;
+            ex_title)     echo "Исключения" ;;
+            ex_menu)      echo "Приложения, где autoswitch не вмешивается" ;;
+            ex_pick)      echo "Выбрать из списка (поиск)" ;;
+            ex_steam)     echo "Steam (все игры) — одной галочкой" ;;
+            ex_current)   echo "Добавить текущее активное окно" ;;
+            ex_show)      echo "Показать текущий список" ;;
+            ex_search)    echo "Поиск (пусто = все). Enter — показать список:" ;;
+            ex_choose)    echo "Отметь приложения (Пробел), Enter — сохранить" ;;
+            ex_none)      echo "Список пуст. Ничего не найдено по запросу." ;;
+            ex_saved)     echo "Исключения сохранены и применены" ;;
+            ex_steam_on)  echo "Steam добавлен в исключения (весь клиент и игры)." ;;
+            ex_steam_off) echo "Steam убран из исключений." ;;
+            ex_steam_q)   echo "Steam сейчас в исключениях. Убрать?" ;;
+            ex_steam_add) echo "Добавить весь Steam (клиент + все игры) в исключения?" ;;
+            ex_cur_wait)  echo "Переключись на нужное окно за 3 сек..." ;;
+            ex_cur_got)   echo "Поймано окно" ;;
+            ex_cur_none)  echo "Не удалось определить окно (мост недоступен?)." ;;
+            ex_cur_add)   echo "Добавить это окно в исключения?" ;;
+            ex_cur_done)  echo "Окно добавлено в исключения." ;;
+            ex_x11note)   echo "На X11 определение окна идёт через xlib." ;;
+            ex_list_hdr)  echo "Текущие исключения" ;;
+            ex_keep)      echo "Снимите галочку, чтобы убрать из исключений" ;;
+            ex_search_btn) echo "Поиск" ;;
+            ex_empty)     echo "(пусто — только дефолтные терминалы)" ;;
+            set_saved)    echo "Изменения сохранены.\nПерезапустить autoswitch сейчас?" ;;
+            lang_title)   echo "Язык интерфейса / Language" ;;
+            lang_changed) echo "Язык изменён. Откройте меню заново." ;;
+            td_title)     echo "Мой словарь" ;;
+            td_count)     echo "Ваших слов" ;;
+            td_note)      echo "Слова-исключения — не переключаются автоматически.\nСписок пополняется сам при отмене исправлений." ;;
+            td_add)       echo "Добавить слово" ;;
+            td_view)      echo "Посмотреть мои слова" ;;
+            td_edit)      echo "Редактировать файл" ;;
+            td_reset)     echo "Очистить мой словарь" ;;
+            td_add_t)     echo "Добавить слово" ;;
+            td_add_p)     echo "Введите слово так, как оно выглядит на экране (напр. myapp или идее):" ;;
+            td_lang_t)    echo "Язык слова" ;;
+            td_lang_p)    echo "В какой раскладке ОСТАВЛЯТЬ это слово?" ;;
+            td_lang_us)   echo "English — оставлять в английской" ;;
+            td_lang_ru)   echo "Русский — оставлять в русской" ;;
+            td_exists)    echo "Уже есть" ;;
+            td_exists_m)  echo "Слово уже в словаре." ;;
+            td_added)     echo "Добавлено" ;;
+            td_file_hint) echo "# Мой словарь. Формат: слово ПРОБЕЛ язык (ru или us)\n#   идее ru   — оставлять русским\n#   myapp us  — оставлять английским\n# Слово без языка = английское. Пополняется сам при отмене исправлений." ;;
+            td_hint)      echo "Слова-исключения: не переключаются автоматически. Формат: слово и язык через пробел — «идее ru» (русским) или «myapp us» (английским). Без языка = английское. Список пополняется сам при отмене исправлений (двойной Shift или Pause)." ;;
+            td_your)      echo "Ваши слова" ;;
+            td_empty)     echo "(пусто — вы ещё не добавляли слов)" ;;
+            td_edited)    echo "Файл изменён" ;;
+            td_applied)   echo "перезапуск не нужен, изменения применяются сразу" ;;
+            td_updated)   echo "Мой словарь обновлён" ;;
+            td_reset_t)   echo "Очистить мой словарь" ;;
+            td_reset_m)   echo "Все ВАШИ добавленные и выученные слова будут удалены.\nВстроенная база команд останется.\n\nПродолжить?" ;;
+            td_reset_pw)  echo "Подтверждение очистки" ;;
+            td_reset_ok)  echo "Мой словарь очищен" ;;
+            pw_prompt)    echo "Введите системный пароль для подтверждения:" ;;
+            pw_error)     echo "Неверный пароль. Действие отменено." ;;
+            error)        echo "Ошибка" ;;
+            no_dialog)    echo "Пакет 'dialog' не установлен. Установи: sudo apt install dialog" ;;
+            *)            echo "$k" ;;
+        esac
+    else
+        case "$k" in
+            title_main)   echo "Autoswitch" ;;
+            select)       echo "Select" ;;
+            exit)         echo "Exit" ;;
+            back)         echo "Back" ;;
+            yes)          echo "Yes" ;;
+            no)           echo "No" ;;
+            cancel)       echo "Cancel" ;;
+            ok)           echo "OK" ;;
+            add)          echo "Add" ;;
+            state)        echo "State" ;;
+            autostart)    echo "Autostart" ;;
+            running)      echo "running" ;;
+            stopped)      echo "stopped" ;;
+            on)           echo "on" ;;
+            off)          echo "off" ;;
+            m_start)      echo "Start" ;;
+            m_stop)       echo "Stop" ;;
+            m_restart)    echo "Restart" ;;
+            m_autostart)  echo "Autostart" ;;
+            m_settings)   echo "Settings" ;;
+            m_status)     echo "Status" ;;
+            m_log)        echo "Journal (log)" ;;
+            m_manual)     echo "User manual" ;;
+            man_read)     echo "Read" ;;
+            man_save)     echo "Save to file" ;;
+            man_where)    echo "Where to save the manual?" ;;
+            man_ok)       echo "Saved: %s" ;;
+            man_err)      echo "Could not write the file." ;;
+            log_view)     echo "Journal (log)" ;;
+            log_save)     echo "Save to file" ;;
+            cfg_saved_restarted) echo "Saved, service restarted" ;;
+            cfg_unchanged) echo "No changes" ;;
+            log_clear)    echo "Clear the journal" ;;
+            log_clear_t)  echo "Clear the journal?" ;;
+            log_clear_q)  echo "The autoswitch log will be erased permanently.\n\nLogs are stored in:\n~/Applications/autoswitch.logs/autoswitch.log\n\nProceed?" ;;
+            log_cleared)  echo "Journal cleared" ;;
+            log_none)     echo "The journal is empty.\n\nFile: $LOGFILE\n\nEntries appear after the service runs for the first time. If the service is running and the journal is still empty, check the log_max_size setting." ;;
+            log_save_note) echo "The whole service journal will be saved.\n\nChoose a folder?" ;;
+            log_where)    echo "Save to:" ;;
+            dir_default)  echo "Next to the program (Applications)" ;;
+            dir_home)     echo "Home folder" ;;
+            dir_downloads) echo "Downloads" ;;
+            dir_documents) echo "Documents" ;;
+            dir_other)    echo "Other folder..." ;;
+            dir_ask)      echo "Path to folder:" ;;
+            dir_confirm)  echo "Save the log to:" ;;
+            log_saved)    echo "Log saved" ;;
+            m_techdict)   echo "My dictionary" ;;
+            r_starting)   echo "Starting autoswitch" ;;
+            r_stopping)   echo "Stopping autoswitch" ;;
+            r_restarting) echo "Restarting autoswitch" ;;
+            svc_running)  echo "● Service RUNNING" ;;
+            svc_stopped)  echo "○ Service STOPPED" ;;
+            details)      echo "details" ;;
+            press_back)   echo "ESC or Enter — back..." ;;
+            as_title)     echo "Autostart" ;;
+            as_now_on)    echo "currently: enabled" ;;
+            as_now_off)   echo "currently: disabled" ;;
+            as_enable)    echo "Enable" ;;
+            as_disable)   echo "Disable" ;;
+            as_on_done)   echo "Autostart enabled" ;;
+            as_off_done)  echo "Autostart disabled" ;;
+            set_title)    echo "Settings" ;;
+            set_config)   echo "Edit config" ;;
+            set_export)   echo "Export settings" ;;
+            set_import)   echo "Import settings" ;;
+            exp_t)        echo "Export settings" ;;
+            exp_p)        echo "Where to save the transfer file?\nIt will contain the settings and \"My dictionary\"." ;;
+            exp_ok)       echo "Saved: %s" ;;
+            exp_err)      echo "Could not write the file." ;;
+            imp_t)        echo "Import settings" ;;
+            imp_p)        echo "Path to the transfer file:" ;;
+            imp_bad)      echo "This is not an autoswitch settings transfer file." ;;
+            imp_ask)      echo "Settings will be replaced with the file contents.\n\"My dictionary\" will be merged: words from the file win.\n\nContinue?" ;;
+            imp_ok)       echo "Imported. Words in the dictionary: %s" ;;
+            set_lang)     echo "Язык / Language" ;;
+            set_excl)     echo "App exclusions" ;;
+            set_indicator) echo "Panel indicator" ;;
+            ind_title)    echo "Panel indicator" ;;
+            ind_now)      echo "Now" ;;
+            ind_on)       echo "Show indicator" ;;
+            ind_off)      echo "Hide indicator" ;;
+            ind_on_done)  echo "Indicator enabled" ;;
+            ind_off_done) echo "Indicator hidden" ;;
+            ind_hint)     echo "Colored status dot in the system panel. Does not affect autoswitch — it is only an icon." ;;
+            ex_title)     echo "Exclusions" ;;
+            ex_menu)      echo "Apps where autoswitch stays silent" ;;
+            ex_pick)      echo "Pick from list (search)" ;;
+            ex_steam)     echo "Steam (all games) — one checkbox" ;;
+            ex_current)   echo "Add current focused window" ;;
+            ex_show)      echo "Show current list" ;;
+            ex_search)    echo "Search (empty = all). Enter to list:" ;;
+            ex_choose)    echo "Mark apps (Space), Enter to save" ;;
+            ex_none)      echo "List is empty. Nothing matched your search." ;;
+            ex_saved)     echo "Exclusions saved and applied" ;;
+            ex_steam_on)  echo "Steam added to exclusions (client and all games)." ;;
+            ex_steam_off) echo "Steam removed from exclusions." ;;
+            ex_steam_q)   echo "Steam is currently excluded. Remove it?" ;;
+            ex_steam_add) echo "Exclude the whole Steam (client + all games)?" ;;
+            ex_cur_wait)  echo "Switch to the target window within 3 sec..." ;;
+            ex_cur_got)   echo "Captured window" ;;
+            ex_cur_none)  echo "Could not detect window (bridge unavailable?)." ;;
+            ex_cur_add)   echo "Add this window to exclusions?" ;;
+            ex_cur_done)  echo "Window added to exclusions." ;;
+            ex_x11note)   echo "On X11 window detection uses xlib." ;;
+            ex_list_hdr)  echo "Current exclusions" ;;
+            ex_keep)      echo "Uncheck to remove from exclusions" ;;
+            ex_search_btn) echo "Search" ;;
+            ex_empty)     echo "(empty — default terminals only)" ;;
+            set_saved)    echo "Changes saved.\nRestart autoswitch now?" ;;
+            lang_title)   echo "Язык интерфейса / Language" ;;
+            lang_changed) echo "Language changed. Please reopen the menu." ;;
+            td_title)     echo "My dictionary" ;;
+            td_count)     echo "Your words" ;;
+            td_note)      echo "Exception words — not switched automatically.\nThe list also grows on its own when you undo a correction." ;;
+            td_add)       echo "Add word" ;;
+            td_view)      echo "View my words" ;;
+            td_edit)      echo "Edit file" ;;
+            td_reset)     echo "Clear my dictionary" ;;
+            td_add_t)     echo "Add word" ;;
+            td_add_p)     echo "Enter the word as it looks on screen (e.g. myapp or привет):" ;;
+            td_lang_t)    echo "Word language" ;;
+            td_lang_p)    echo "Which layout should this word STAY in?" ;;
+            td_lang_us)   echo "English — keep in English" ;;
+            td_lang_ru)   echo "Russian — keep in Russian" ;;
+            td_exists)    echo "Already exists" ;;
+            td_exists_m)  echo "Word is already in the dictionary." ;;
+            td_added)     echo "Added" ;;
+            td_file_hint) echo "# My dictionary. Format: word SPACE language (ru or us)\n#   hello us  — keep in English\n#   привет ru — keep in Russian\n# Word without a language = English. Grows on its own when you undo a fix." ;;
+            td_hint)      echo "Exception words: not switched automatically. Format: word and language, e.g. \"hello us\" or \"myapp us\". No language = English. The list also grows on its own when you undo a correction (double Shift or Pause)." ;;
+            td_your)      echo "Your words" ;;
+            td_empty)     echo "(empty — you haven't added words yet)" ;;
+            td_edited)    echo "File changed" ;;
+            td_applied)   echo "no restart needed, changes apply immediately" ;;
+            td_updated)   echo "My dictionary updated" ;;
+            td_reset_t)   echo "Clear my dictionary" ;;
+            td_reset_m)   echo "All YOUR added and learned words will be removed.\nThe built-in command base remains.\n\nProceed?" ;;
+            td_reset_pw)  echo "Clear confirmation" ;;
+            td_reset_ok)  echo "My dictionary cleared" ;;
+            pw_prompt)    echo "Enter system password to confirm:" ;;
+            pw_error)     echo "Wrong password. Action cancelled." ;;
+            error)        echo "Error" ;;
+            no_dialog)    echo "Package 'dialog' is not installed. Install: sudo apt install dialog" ;;
+            # подсказка в просмотре пока только на русском
+            *)            echo "$k" ;;
+        esac
+    fi
+}
+
+# ---------- тема dialog (как rn/f2b) ----------
+# Имя своё для каждого пользователя: строка выполняется до получения
+# прав, и общий файл, созданный когда-то под root, перезаписать нельзя
+DIALOG_RC="${TMPDIR:-/tmp}/dlg_asc-$(id -u).rc"
+cat > "$DIALOG_RC" << 'RCEOF'
+use_shadow = OFF
+use_colors = ON
+screen_color = (CYAN,BLACK,ON)
+dialog_color = (WHITE,BLACK,OFF)
+title_color = (CYAN,BLACK,ON)
+border_color = (CYAN,BLACK,ON)
+border2_color = (CYAN,BLACK,ON)
+# Полоса выбора и кнопка под курсором — синий фон, штатный BLUE самого
+# dialog. Выглядит одинаково во всех терминалах, перекрашивать ничего не
+# нужно. Выбран по замерам контраста: полосу видно лучше всех остальных
+# фонов (4.2 к фону окна), а цвета пунктов на ней ложатся ровно, без
+# провалов — 1.5–2.3 у каждого, тогда как на светлой подложке жёлтый,
+# зелёный и голубой падали до 1.1. Синий в пунктах меню поэтому не
+# используется: \Z4 в тексте нет.
+
+button_active_color = (WHITE,BLUE,ON)
+button_inactive_color = (WHITE,BLACK,OFF)
+button_key_active_color = (YELLOW,BLUE,ON)
+button_key_inactive_color = (WHITE,BLACK,OFF)
+button_label_active_color = (WHITE,BLUE,ON)
+button_label_inactive_color = (WHITE,BLACK,OFF)
+menubox_color = (WHITE,BLACK,OFF)
+menubox_border_color = (CYAN,BLACK,ON)
+menubox_border2_color = (CYAN,BLACK,ON)
+item_color = (WHITE,BLACK,OFF)
+item_selected_color = (WHITE,BLUE,ON)
+tag_color = (WHITE,BLACK,OFF)
+tag_selected_color = (WHITE,BLUE,ON)
+tag_key_color = (WHITE,BLACK,OFF)
+tag_key_selected_color = (WHITE,BLUE,ON)
+inputbox_color = (WHITE,BLACK,OFF)
+inputbox_border_color = (CYAN,BLACK,ON)
+searchbox_color = (WHITE,BLACK,OFF)
+position_indicator_color = (CYAN,BLACK,ON)
+darrow_color = (CYAN,BLACK,ON)
+uarrow_color = (CYAN,BLACK,ON)
+RCEOF
+export DIALOGRC="$DIALOG_RC"
+# Меню не должны копиться друг под другом в прокрутке.
+#
+# Решение — как в rn: dialog рисует UI через 3>&1 1>&2 2>&3 (на настоящий
+# stdout, не в stderr через /dev/tty), а экран чистим обычным clear ПОСЛЕ
+# выхода из каждого меню, а не до. Тогда следующий вывод (меню, статус,
+# журнал) ложится на чистое место, и коробки не накапливаются.
+#
+# RIS (\033c) и очистку истории (\033[3J) не используем: на части терминалов
+# они как раз оставляли хвосты в прокрутке. clear (terminfo) ведёт себя
+# одинаково везде.
+# Управляющие последовательности шлём терминалу. Обычный вывод не годится:
+# меню вызывается внутри $( ), там он перехватывается в переменную. Если
+# /dev/tty почему-то недоступен, пишем в стандартный поток ошибок — он у нас
+# всегда связан с терминалом.
+tty_seq() {
+    if [ -w /dev/tty ]; then printf '%b' "$1" >/dev/tty
+    else printf '%b' "$1" >&2
+    fi
+}
+# Очистка экрана как в rn: обычный clear (terminfo). Никаких RIS/\033[3J —
+# они-то и оставляли хвосты в истории на части терминалов. clear вызывается
+# ПОСЛЕ выхода из меню (не до), и меню в истории не копятся.
+clear_all() { clear >/dev/tty 2>/dev/null || clear; }
+
+# Раскраска журнала по источнику сообщения, а не по словам в тексте.
+# Красить по ключевым словам оказалось плохо: половина строк становилась
+# зелёной и толку от цвета не было. Здесь у каждой части своя роль:
+# метка времени и имя машины приглушены, а источник — systemd, сама служба,
+# ядро — своим цветом, потому что каждый пишет свой род сообщений.
+colorize_log() {
+    awk '
+    {
+        line = $0
+
+        # строки systemctl status: Active:, Loaded:, Main PID: и прочие —
+        # у них своя форма, «поле: значение» в начале строки
+        if (match(line, /^ *[A-Z][A-Za-z ]+: /)) {
+            fld  = substr(line, 1, RLENGTH)
+            val  = substr(line, RLENGTH + 1)
+            low  = tolower(val)
+            # красим только «active (running)» — остальное словами и так
+            # понятно, а от обилия цвета рябит в глазах
+            if (low ~ /^active \(running\)/) {
+                printf "\033[90m%s\033[0m\033[92m%s\033[0m\n", fld, val
+                next
+            }
+            printf "\033[90m%s\033[0m%s\n", fld, val
+            next
+        }
+
+        # "авг 05 17:01:11 alt-kde systemd[1]: текст"
+        if (match(line, /^[^ ]+ +[0-9]+ +[0-9]+:[0-9]+:[0-9]+ +[^ ]+ +[^ ]+: /)) {
+            head = substr(line, 1, RLENGTH)
+            body = substr(line, RLENGTH + 1)
+
+            # делим шапку на время с машиной и на источник
+            if (match(head, / [^ ]+: $/)) {
+                src  = substr(head, RSTART + 1, RLENGTH - 2)
+                when = substr(head, 1, RSTART)
+            } else { src = ""; when = head }
+
+            c = "\033[96m"                       # по умолчанию
+            if (src ~ /^systemd/)      c = "\033[94m"
+            else if (src ~ /^kernel/)  c = "\033[95m"
+            else if (src ~ /^env/)     c = "\033[92m"
+
+            printf "\033[90m%s\033[0m%s%s\033[0m %s\n", when, c, src, body
+        } else {
+            print line
+        }
+    }'
+}
+
+# Журнал и статус печатаем целиком, обычным выводом.
+#
+# Свой постраничный просмотрщик пришлось выбросить: он перерисовывает экран,
+# поэтому выделение слетало при каждом нажатии, «выделить всё» захватывало
+# только текущую страницу, а протянуть мышью вниз с прокруткой было нельзя
+# вовсе. Обычный вывод всего этого лишён — выделение, автопрокрутка при
+# протягивании, колесо и полоса работают средствами самого терминала.
+#
+# История прокрутки в окне выключена, иначе меню при перерисовке уезжает
+# вверх. Поэтому перед просмотром ставим метку в заголовке терминала: наше
+# окно (asc-term) по ней включает историю, а на выходе убирает.
+view_mark()      { tty_seq '\033]0;asc:view\007'; }
+# для статуса просим окно поднять вид в начало: главные строки там первые
+view_mark_top()  { tty_seq '\033]0;asc:viewtop\007'; }
+view_unmark() { tty_seq '\033]0;asc:menu\007'; }
+
+view_text() {
+    local title="$1" body="$2" from_top="${3:-}"
+    view_mark
+    # Экран уже очищен clear-ом после выхода из меню (модель rn). Печатаем
+    # прямо на чистое место, историю не трогаем — прокрутка журнала работает.
+    printf '=== %s ===\n\n' "$title"
+    printf '%s\n\n' "$body"
+    [ -n "$from_top" ] && view_mark_top
+    read_esc_or_enter
+    view_unmark
+    # перед возвратом в меню чистим, чтобы меню не легло поверх журнала
+    clear_all
+}
+
+have_dialog() { command -v "$DIALOG_BIN" >/dev/null 2>&1; }
+
+# Обёртка над dialog. Экран НЕ чистим — dialog сам входит на отдельный
+# (альтернативный) экран, как less/mc/vim, и при выходе возвращает прежний.
+# Основной буфер и история прокрутки при этом не трогаются, поэтому кадры
+# меню не копятся друг под другом — так же чисто работает rn. Оставляем
+# только метку окну asc-term: по ней оно понимает, что показано меню.
+dlg() {
+    tty_seq '\033]0;asc:menu\007'
+    command "$DIALOG_BIN" "$@"
+}
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        # sudo вычищает окружение, а метку своего окна надо сохранить —
+        # по ней в шапке показывается подсказка про горячие клавиши
+        if [ -n "${ASC_TERM_OWN:-}" ]; then
+            exec sudo ASC_TERM_OWN=1 "$0" "$@"
+        fi
+        exec sudo "$0" "$@"
+    fi
+}
+
+is_active()  { systemctl is-active  --quiet "$SERVICE"; }
+is_enabled() { systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; }
+
+read_esc_or_enter() {
+    printf "%s" "$(t press_back)"
+    local key rest
+    while IFS= read -rsn1 key; do
+        if [ -z "$key" ]; then
+            break                      # Enter
+        fi
+        if [ "$key" = $'\e' ]; then
+            # может быть чистый ESC или начало escape-последовательности (стрелки)
+            # дочитываем остаток без блокировки: если пришли ещё символы — это стрелка
+            read -rsn2 -t 0.05 rest 2>/dev/null
+            if [ -z "$rest" ]; then
+                break                  # чистый ESC — выход
+            fi
+            # иначе это стрелка/спецклавиша — игнорируем, продолжаем ждать
+        fi
+    done
+    echo
+}
+
+# Сообщение без кнопки: показывается пару секунд и гаснет само. Для
+# подтверждения сохранения жать OK незачем — это лишний щелчок.
+# Размер окна под сам текст. Раньше высота была задана намертво (8 строк
+# у вопроса, 12 у сообщения), и длинный текст в неё не влезал: dialog
+# включал прокрутку и рисовал в углу проценты, а при крупном шрифте, когда
+# строк на экране мало, в окне не оставалось места под текст вовсе — была
+# видна пустая рамка. Теперь размер считается по тексту.
+#   $1 — текст, $2 — наименьшая ширина, $3 — надбавка к высоте:
+#   4 для вопроса и сообщения (рамка + пустая строка + кнопки),
+#   2 для сообщения без кнопок. Проверено на живом dialog.
+bsize() {
+    local text="$1" wmin="${2:-46}" extra="${3:-4}"
+    local lines cols
+    read -r lines cols < <(stty size </dev/tty 2>/dev/null || echo "24 80")
+    [ -z "$lines" ] && lines=24
+    [ -z "$cols" ]  && cols=80
+    # \n — это перенос строки, а \Zx — цвет; в ширину ни то, ни другое не идёт
+    local plain
+    plain="$(printf '%b' "${text//\\Z[0-9bBnNuUrR]/}")"
+    # Длину считаем в ЗНАКАХ, а не в байтах: под sudo окружение вычищается,
+    # LANG может стать C, и тогда кириллица считалась бы вдвое длиннее —
+    # окно раздувалось на весь экран. Убираем хвостовые байты UTF-8 и
+    # меряем то, что осталось: результат одинаков при любой локали.
+    local n w
+    read -r n w < <(printf '%s\n' "$plain" | LC_ALL=C awk '
+        { s = $0; gsub(/[\200-\277]/, "", s)
+          if (length(s) > m) m = length(s); n++ }
+        END { print n + 0, m + 0 }')
+    [ "$w" -lt "$wmin" ] && w="$wmin"
+    w=$((w + 6))
+    [ "$w" -gt $((cols - 4)) ] && w=$((cols - 4))
+    # длинную строку dialog переносит сам — считаем, сколько строк добавится
+    local wrapped
+    wrapped="$(printf '%s\n' "$plain" | LC_ALL=C awk -v inner=$((w - 4)) '
+        { s = $0; gsub(/[\200-\277]/, "", s)
+          if (inner > 0 && length(s) > inner) e += int(length(s) / inner) }
+        END { print e + 0 }')"
+    local h=$((n + wrapped + extra))
+    [ "$h" -gt $((lines - 2)) ] && h=$((lines - 2))
+    [ "$h" -lt 5 ] && h=5
+    printf '%s %s' "$h" "$w"
+}
+
+d_flash() {
+    "$DIALOG" --backtitle "$BACKTITLE" --colors --infobox "$1" $(bsize "$1" 46 2)
+    sleep 2
+}
+
+d_msg() {
+    "$DIALOG" --backtitle "$BACKTITLE" --colors --title "$1" \
+              --ok-label "$(t ok)" --msgbox "$2" $(bsize "$2" 46 4)
+}
+
+d_confirm() {
+    "$DIALOG" --backtitle "$BACKTITLE" --colors --title "$1" \
+              --yes-label "$(t yes)" --no-label "$(t no)" --yesno "$2" $(bsize "$2" 46 4)
+}
+
+d_password() {
+    local pw
+    pw="$("$DIALOG" --backtitle "$BACKTITLE" --title "$1" \
+          --insecure --passwordbox "$(t pw_prompt)" 9 56 3>&1 1>&2 2>&3)"
+    [ $? -ne 0 ] && return 1
+    if echo "$pw" | sudo -S -k true 2>/dev/null; then return 0; fi
+    d_msg "$(t error)" "$(t pw_error)"
+    return 1
+}
+
+show_result() {
+    local action="$1"
+    clear
+    local G=$'\e[1;32m' R=$'\e[1;31m' C=$'\e[1;36m' N=$'\e[0m'
+    echo "${C}=== $action ===${N}"; echo
+    if is_active; then echo "  ${G}$(t svc_running)${N}"; else echo "  ${R}$(t svc_stopped)${N}"; fi
+    echo; echo "${C}--- $(t details) ---${N}"
+    systemctl status "$SERVICE" --no-pager 2>&1 | sed 's/^/  /'
+    echo
+    read_esc_or_enter
+    clear_all
+}
+
+# Размер меню считаем сами, а не отдаём dialog.
+# С тремя нулями («авто высота, авто ширина, авто список») dialog занижает
+# число видимых строк и включает прокрутку даже когда на экране полно места.
+# Поэтому: видимых строк ровно столько, сколько пунктов, высота коробки на
+# восемь больше (заголовок, строка состояния, кнопки, рамки), и всё это
+# ограничено размером терминала. Ширину оставляем на усмотрение dialog.
+# Возвращает три числа: высота, ширина, число строк списка.
+msize() {
+    # $1 — сколько пунктов, $2 — сколько строк текста над списком,
+    # $3 — наименьшая ширина окна (необязательно).
+    #
+    # Ширину dialog обычно считает сам, по самому длинному пункту. Но в
+    # главном меню над списком стоит строка состояния, и она длиннее
+    # пунктов: по-английски они короткие («Start», «Stop»), окно выходило
+    # узким, и шапка обрезалась на «Autosta». По-русски пункты длиннее, и
+    # беда не проявлялась. Поэтому там задаём наименьшую ширину.
+    local n="$1" tl="${2:-0}" wmin="${3:-0}" lines cols
+    # спрашиваем именно у терминала: внутри $( ) стандартный ввод может
+    # быть уже не им, и размер прочитается неверно
+    read -r lines cols < <(stty size </dev/tty 2>/dev/null || echo "24 80")
+    [ -z "$lines" ] && lines=24
+    [ -z "$cols" ]  && cols=80
+    # 7 строк уходит на рамки, заголовок и кнопки, плюс строки текста над
+    # списком. Числа выверены на живом dialog: меньше — появляется прокрутка,
+    # больше — под пунктами остаётся пустое место, лишнее отдаётся списку.
+    local h=$(( n + 7 + tl ))
+    local m="$n"
+    # на тесном экране показываем столько, сколько поместится
+    if [ "$h" -gt $(( lines - 2 )) ]; then
+        h=$(( lines - 2 ))
+        m=$(( h - 7 - tl ))
+        [ "$m" -lt 1 ] && m=1
+    fi
+    local w=0
+    if [ "$wmin" -gt 0 ]; then
+        w="$wmin"
+        # но не шире экрана — иначе окно уедет за край
+        [ "$w" -gt $(( cols - 4 )) ] && w=$(( cols - 4 ))
+    fi
+    echo "$h $w $m"
+}
+
+status_text() {
+    local st au
+    # «остановлен» показываем нейтральным: это обычное состояние, а не
+    # авария. Красный (\Z1) бережём для настоящих ошибок — так же, как
+    # в индикаторе и графическом меню.
+    if is_active; then st="\Zb\Z2$(t running)\Zn"; else st="\Zb\Z7$(t stopped)\Zn"; fi
+    if is_enabled; then au="\Zb\Z2$(t on)\Zn"; else au="\Zb\Z3$(t off)\Zn"; fi
+    printf "%s:  %s        %s:  %s" "$(t state)" "$st" "$(t autostart)" "$au"
+}
+
+set_cfg() {  # set_cfg key value
+    if grep -qE "^$1=" "$CONFIG" 2>/dev/null; then
+        sed -i "s/^$1=.*/$1=$2/" "$CONFIG"
+    else
+        echo "$1=$2" >> "$CONFIG"
+    fi
+}
+
+# ---------- прямые команды ----------
+cmd_start()   { need_root "$@"; systemctl start   "$SERVICE" && echo "autoswitch started"; }
+cmd_stop()    { need_root "$@"; systemctl stop    "$SERVICE" && echo "autoswitch stopped"; }
+cmd_restart() { need_root "$@"; systemctl restart "$SERVICE" && echo "autoswitch restarted"; }
+cmd_enable()  { need_root "$@"; systemctl enable  "$SERVICE" && echo "autostart enabled"; }
+cmd_disable() { need_root "$@"; systemctl disable "$SERVICE" && echo "autostart disabled"; }
+cmd_status()  { systemctl status "$SERVICE" --no-pager; }
+cmd_log()     { tail -n 40 "$LOGFILE" 2>/dev/null; }
+# Правка конфига: после сохранения СРАЗУ перезапускаем службу — она читает
+# настройки только при старте, и без перезапуска правка «не работает».
+# Но если пользователь ничего не менял, службу не трогаем: незачем ронять
+# её на секунду просто потому, что открыли редактор.
+cmd_config()  {
+    need_root "$@"
+    _sum_before="$(md5sum "$CONFIG" 2>/dev/null)"
+    "$EDITOR_BIN" "$CONFIG"
+    _sum_after="$(md5sum "$CONFIG" 2>/dev/null)"
+    if [ "$_sum_before" = "$_sum_after" ]; then
+        echo "$(t cfg_unchanged)"
+    else
+        systemctl restart "$SERVICE" 2>/dev/null && { poke_indicator; echo "$(t cfg_saved_restarted)"; }
+    fi
+}
+
+# ---------- подменю настроек ----------
+# ---------- Исключения приложений ----------
+
+# Прочитать текущий exclude_apps как нормализованный список токенов (нижний регистр).
+excl_read() {
+    grep -E '^exclude_apps=' "$CONFIG" 2>/dev/null | cut -d= -f2- \
+        | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | tr '[:upper:]' '[:lower:]' | grep -v '^$'
+}
+
+# Записать список токенов (по одному в строке в stdin) обратно в конфиг.
+excl_write() {
+    local joined
+    joined="$(paste -sd, - | sed 's/,,*/,/g; s/^,//; s/,$//')"
+    set_cfg exclude_apps "$joined"
+    # Движок читает конфиг только при старте, поэтому список сам по себе
+    # ничего не меняет: без перезапуска приложение остаётся в исключениях
+    # лишь на бумаге. Перезапускаем сразу — иначе легко решить, что
+    # исключение не работает.
+    if is_active; then
+        systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+    fi
+}
+
+# Steam-префиксы, которыми ловим весь Steam одной галочкой.
+EXCL_STEAM_TOKENS='steam* com.valvesoftware.steam*'
+
+# Есть ли Steam в исключениях (по префиксу com.valvesoftware.steam*).
+excl_has_steam() {
+    excl_read | grep -qx 'com.valvesoftware.steam\*'
+}
+
+# Собрать список установленных .desktop → "класс|Имя".
+# Класс: StartupWMClass, иначе basename .desktop без расширения.
+excl_scan_desktops() {
+    local dirs="/usr/share/applications $HOME/.local/share/applications /var/lib/flatpak/exports/share/applications $HOME/.local/share/flatpak/exports/share/applications"
+    local f name name_loc wmclass cls
+    # Языковой код для Name[xx]: в .desktop лежат и английское Name=, и
+    # переводы. Меню рабочего стола показывает перевод, поэтому в списке
+    # он и нужен — иначе «Редактор рисунков» из меню в asc не найти.
+    local loc="${UI_LANG}"
+    for d in $dirs; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.desktop; do
+            [ -e "$f" ] || continue
+            grep -qiE '^NoDisplay=true' "$f" && continue
+            name="$(grep -m1 -E '^Name=' "$f" | cut -d= -f2-)"
+            name_loc="$(grep -m1 -E "^Name\\[${loc}(_[A-Za-z]+)?\\]=" "$f" | cut -d= -f2-)"
+            wmclass="$(grep -m1 -E '^StartupWMClass=' "$f" | cut -d= -f2-)"
+            if [ -n "$wmclass" ]; then
+                cls="$wmclass"
+            else
+                cls="$(basename "$f" .desktop)"
+            fi
+            [ -z "$name" ] && name="$cls"
+            cls="$(echo "$cls" | tr '[:upper:]' '[:lower:]')"
+            # третье поле — только для поиска: там оба названия и класс,
+            # чтобы находилось и по русскому имени, и по английскому
+            if [ -n "$name_loc" ] && [ "$name_loc" != "$name" ]; then
+                echo "$cls|$name_loc|$cls $name $name_loc"
+            else
+                echo "$cls|$name|$cls $name"
+            fi
+        done
+    done | sort -t'|' -k2 -f -u
+}
+
+# Определить класс активного окна (Wayland — мост, X11 — xprop).
+# asc обычно запущен от root (need_root). Мост висит на session-шине
+# пользователя, поэтому под root вызываем gdbus от имени SUDO_UID.
+excl_gdbus_class() {
+    local uid="${SUDO_UID:-$(id -u)}"
+    if [ "$(id -u)" = "0" ] && [ "$uid" != "0" ]; then
+        sudo -n -u "#$uid" env \
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+            "XDG_RUNTIME_DIR=/run/user/$uid" \
+            gdbus call --session -d org.gnome.Shell \
+            -o /org/gnome/Shell/Extensions/AutoswitchFocus \
+            -m org.gnome.Shell.Extensions.AutoswitchFocus.GetFocusedClass 2>/dev/null
+    else
+        gdbus call --session -d org.gnome.Shell \
+            -o /org/gnome/Shell/Extensions/AutoswitchFocus \
+            -m org.gnome.Shell.Extensions.AutoswitchFocus.GetFocusedClass 2>/dev/null
+    fi
+}
+
+excl_current_window() {
+    # На XDG_SESSION_TYPE полагаться нельзя: asc перезапускает себя через
+    # sudo, а тот вычищает переменные сессии — переменная оказывается
+    # пустой, проверка на Wayland не срабатывает, и определение уходит в
+    # ветку X11, где xprop под Wayland ничего не находит. Поэтому просто
+    # опрашиваем все три источника по очереди и берём первый ответивший.
+    local uid="${SUDO_UID:-$(id -u)}"
+    local cls=""
+
+    # 1) Plasma: файл приёмника, куда пишет KWin-скрипт
+    local focus_file="/run/user/$uid/autoswitch-focus"
+    if [ -r "$focus_file" ]; then
+        cls="$(tr -d '\n' < "$focus_file" | tr '[:upper:]' '[:lower:]')"
+        [ -n "$cls" ] && { echo "$cls"; return; }
+    fi
+
+    # 2) GNOME: мост расширения оболочки
+    cls="$(excl_gdbus_class | sed -n "s/.*'\\(.*\\)'.*/\\1/p" \
+           | tr '[:upper:]' '[:lower:]')"
+    [ -n "$cls" ] && { echo "$cls"; return; }
+
+    # 3) X11: напрямую через свойства корневого окна. Под sudo нет ни
+    # DISPLAY, ни прав на X-сервер пользователя, поэтому xprop запускаем
+    # от него же.
+    command -v xprop >/dev/null 2>&1 || return
+    local id
+    # xprop печатает "window id # 0x4600007, 0x0" — второй идентификатор
+    # это заглушка, и последнее поле брать нельзя: получалось 0x0.
+    id="$(x_as_user xprop -root _NET_ACTIVE_WINDOW 2>/dev/null \
+          | sed -n 's/.*#[[:space:]]*\(0x[0-9a-fA-F]*\).*/\1/p')"
+    [ -z "$id" ] && return
+    [ "$id" = "0x0" ] && return
+    x_as_user xprop -id "$id" WM_CLASS 2>/dev/null \
+        | sed -n 's/.*"\([^"]*\)"[^"]*$/\1/p' | tr '[:upper:]' '[:lower:]'
+}
+
+# Запуск X-утилиты в сессии пользователя: под sudo переменных X нет.
+x_as_user() {
+    local uid="${SUDO_UID:-$(id -u)}"
+    local u="${SUDO_USER:-$(id -un)}"
+    local home disp
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    disp="${DISPLAY:-:0}"
+    if [ "$(id -u)" = "0" ] && [ "$uid" != "0" ]; then
+        sudo -n -u "#$uid" env "DISPLAY=$disp" "HOME=$home" \
+            "XAUTHORITY=${XAUTHORITY:-$home/.Xauthority}" \
+            "XDG_RUNTIME_DIR=/run/user/$uid" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Тумблер Steam.
+excl_toggle_steam() {
+    need_root "$@"
+    if excl_has_steam; then
+        if d_confirm "$(t ex_title)" "$(t ex_steam_q)"; then
+            excl_read | grep -vx 'steam\*' | grep -vx 'com.valvesoftware.steam\*' | excl_write
+            d_msg "$(t ex_title)" "$(t ex_steam_off)"
+        fi
+    else
+        if d_confirm "$(t ex_title)" "$(t ex_steam_add)"; then
+            { excl_read; echo 'steam*'; echo 'com.valvesoftware.steam*'; } | excl_write
+            d_msg "$(t ex_title)" "$(t ex_steam_on)"
+        fi
+    fi
+}
+
+# Добавить текущее окно.
+excl_add_current() {
+    need_root "$@"
+    d_msg "$(t ex_title)" "$(t ex_cur_wait)"
+    sleep 3
+    local cls
+    cls="$(excl_current_window)"
+    if [ -z "$cls" ]; then
+        d_msg "$(t ex_title)" "$(t ex_cur_none)\n$(t ex_x11note)"
+        return
+    fi
+    if d_confirm "$(t ex_title)" "$(t ex_cur_got): \Zb$cls\Zn\n\n$(t ex_cur_add)"; then
+        { excl_read; echo "$cls"; } | excl_write
+        d_msg "$(t ex_title)" "$(t ex_cur_done)"
+    fi
+}
+
+# Показать текущий список.
+# Список не только показывает, но и правит: снятая галочка убирает
+# приложение из исключений. Отдельный экран удаления не нужен — здесь и так
+# видно всё, что сейчас в списке, включая записи, добавленные вручную и не
+# имеющие своего .desktop.
+excl_show_list() {
+    local cur
+    cur="$(excl_read | grep -v '^steam\*$' | grep -v '^com.valvesoftware.steam\*$')"
+
+    local -a args=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        args+=("$line" "" "on")
+    done <<< "$cur"
+
+    # Steam ловится двумя префиксами сразу, поэтому в списке он одной строкой
+    if excl_has_steam; then
+        args+=("steam" "Steam (steam*, com.valvesoftware.steam*)" "on")
+    fi
+
+    if [ ${#args[@]} -eq 0 ]; then
+        d_msg "$(t ex_list_hdr)" "$(t ex_empty)"
+        return
+    fi
+
+    local chosen rc
+    chosen="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+             --title "$(t ex_list_hdr)" \
+             --ok-label "$(t ok)" --cancel-label "$(t back)" \
+             --checklist "$(t ex_keep)" 20 74 12 \
+             "${args[@]}" 3>&1 1>&2 2>&3)"
+    rc=$?
+    # отмена — список не трогаем
+    [ $rc -ne 0 ] && return
+
+    local keep_file
+    keep_file="$(mktemp)"
+    eval "printf '%s\n' $chosen" 2>/dev/null | grep -v '^$' > "$keep_file"
+
+    {
+        grep -vx 'steam' "$keep_file"
+        if grep -qx 'steam' "$keep_file"; then
+            echo 'steam*'
+            echo 'com.valvesoftware.steam*'
+        fi
+    } | excl_write
+    rm -f "$keep_file"
+    d_flash "$(t ex_saved)"
+}
+
+# Выбор из списка .desktop с поиском.
+excl_pick_from_list() {
+    need_root "$@"
+
+    # Список открывается сразу: чаще всего нужное приложение видно и так.
+    # Поиск — отдельной кнопкой внизу (dialog зовёт её help-кнопкой), а не
+    # строкой внутри списка: строку пришлось бы отмечать пробелом и жать
+    # Enter, о чём никто не догадается. --help-status заставляет dialog
+    # вернуть вместе с нажатием и текущие отметки, поэтому выбранное до
+    # поиска не теряется.
+    local query=""
+
+    local current_file
+    current_file="$(mktemp)"
+    excl_read > "$current_file"
+
+    local rc out chosen shown_file
+    while true; do
+        local args=() cls name search status
+        while IFS='|' read -r cls name search; do
+            [ -z "$cls" ] && continue
+            if [ -n "$query" ]; then
+                echo "$search" | tr '[:upper:]' '[:lower:]' \
+                    | grep -qF "$query" || continue
+            fi
+            if grep -qxF "$cls" "$current_file"; then status="on"; else status="off"; fi
+            args+=("$cls" "$name" "$status")
+        done < <(excl_scan_desktops)
+
+        if [ ${#args[@]} -eq 0 ]; then
+            d_msg "$(t ex_title)" "$(t ex_none)"
+            if [ -z "$query" ]; then rm -f "$current_file"; return; fi
+            query=""
+            continue
+        fi
+
+        out="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+              --title "$(t ex_title)$([ -n "$query" ] && echo ": $query")" \
+              --ok-label "$(t ok)" --cancel-label "$(t back)" \
+              --help-button --help-label "$(t ex_search_btn)" --help-status \
+              --checklist "$(t ex_choose)" 20 74 12 \
+              "${args[@]}" 3>&1 1>&2 2>&3)"
+        rc=$?
+        clear_all
+
+        # отмена — ничего не меняем
+        if [ $rc -eq 1 ] || [ $rc -eq 255 ]; then
+            rm -f "$current_file"
+            return
+        fi
+
+        # rc=2 — нажат «Поиск»; dialog отдаёт "HELP <под курсором> <отметки>"
+        if [ $rc -eq 2 ]; then
+            chosen="$(echo "$out" | sed 's/^HELP  *[^ ]*//')"
+        else
+            chosen="$out"
+        fi
+
+        # запомнить отметки этого экрана: при перерисовке по фильтру они
+        # иначе потеряются
+        shown_file="$(mktemp)"
+        local i=0
+        while [ $i -lt ${#args[@]} ]; do
+            echo "${args[$i]}" >> "$shown_file"
+            i=$((i+3))
+        done
+        {
+            grep -vxF -f "$shown_file" "$current_file"
+            echo "$chosen" | tr ' ' '\n' | sed 's/^"//; s/"$//' | grep -v '^$'
+        } | sort -u > "$current_file.new"
+        mv "$current_file.new" "$current_file"
+        rm -f "$shown_file"
+
+        if [ $rc -eq 2 ]; then
+            query="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                     --title "$(t ex_title)" \
+                     --ok-label "$(t ok)" --cancel-label "$(t back)" \
+                     --inputbox "$(t ex_search)" 9 60 "$query" 3>&1 1>&2 2>&3)"
+            [ $? -ne 0 ] && query=""
+            # пробелы по краям и задвоенные внутри — обычная опечатка при
+            # наборе; без чистки поиск по «Редактор рисунков » ничего не
+            # находит, хотя приложение в списке есть
+            query="$(echo "$query" | tr '[:upper:]' '[:lower:]' \
+                     | sed 's/^ *//; s/ *$//; s/  */ /g')"
+            continue
+        fi
+
+        break
+    done
+
+    sort -u "$current_file" | excl_write
+    rm -f "$current_file"
+    d_flash "$(t ex_saved)"
+}
+
+# Подменю исключений.
+submenu_exclusions() {
+    local sel="1"
+    while true; do
+        local ch cnt
+        # число уже добавленных исключений — показывается у пункта списка
+        cnt="$(excl_read | wc -l)"
+        ch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+             --title "$(t ex_title)" \
+             --default-item "$sel" \
+             --ok-label "$(t select)" --cancel-label "$(t back)" \
+             --menu "$(t ex_menu)" 14 66 4 \
+             1 "\Z2$(t ex_pick)\Zn" \
+             2 "\Z5$(t ex_steam)\Zn" \
+             3 "\Z2$(t ex_current)\Zn" \
+             4 "\Z6$(t ex_show)\Zn ($cnt)" \
+             3>&1 1>&2 2>&3)"
+        [ $? -ne 0 ] && break
+        clear_all
+        case "$ch" in
+            1) sel="1"; excl_pick_from_list "$@" ;;
+            2) sel="2"; excl_toggle_steam "$@" ;;
+            3) sel="3"; excl_add_current "$@" ;;
+            4) sel="4"; excl_show_list ;;
+        esac
+    done
+}
+
+# --- перенос настроек между машинами ---------------------------------
+# Формат нарочно текстовый, а не архив: человек может открыть файл
+# блокнотом, посмотреть, что увозит, и при нужде поправить руками.
+# Внутри две помеченные части: [config] и [learned].
+EXPORT_MARK="# autoswitch settings export"
+
+# Руководство лежит отдельным файлом рядом с движком: один текст на
+# консоль и на окно, править в одном месте. Язык — по ui_lang.
+manual_file() {
+    local f="/usr/local/lib/autoswitch/manual_${UI_LANG:-ru}.txt"
+    [ -r "$f" ] || f="/usr/local/lib/autoswitch/manual_ru.txt"
+    printf '%s' "$f"
+}
+
+manual_save() {
+    local f path home
+    f="$(manual_file)"
+    [ -r "$f" ] || { show_result "$(t man_err)"; return; }
+    home="$(user_home)"; [ -n "$home" ] || home="$HOME"
+    path="$("$DIALOG" --backtitle "$BACKTITLE" --title "$(t man_save)" \
+           --ok-label "$(t log_save)" --cancel-label "$(t cancel)" \
+           --inputbox "$(t man_where)" 10 70 \
+           "$home/autoswitch-manual-$(date +%Y%m%d).txt" 3>&1 1>&2 2>&3)"
+    [ $? -ne 0 ] && return
+    # dialog дописывает пробелы в конец введённой строки
+    path="$(printf '%s' "$path" | sed 's/[[:space:]]*$//')"
+    [ -n "$path" ] || return
+    if cp "$f" "$path" 2>/dev/null; then
+        # файл создан от root — возвращаем владельца, иначе пользователь
+        # не сможет его ни открыть, ни удалить
+        chown "${SUDO_USER:-$USER}" "$path" 2>/dev/null || true
+        show_result "$(printf "$(t man_ok)" "$path")"
+    else
+        show_result "$(t man_err)"
+    fi
+}
+
+# Открываем руководство ПРОСМОТРЩИКОМ, а не печатью в терминал.
+#
+# Печать — это лента: строки уезжают вверх, и на экране остаётся хвост.
+# Человек открывает руководство и сразу видит его конец. Редактор же
+# рисует страницу и начинает с первой строки, как любой открытый файл.
+#
+# Берём тот, что человек назначил себе в EDITOR, иначе первый найденный
+# из привычных. Флаг «только чтение» у каждого свой, отсюда разбор по
+# имени: править руководство незачем, а случайно испортить — можно.
+# Не нашлось ничего — печатаем в терминал, как раньше. Хуже текущего не
+# станет ни на одной системе.
+manual_view() {
+    local f
+    f="$(manual_file)"
+    [ -r "$f" ] || { show_result "$(t m_manual): —"; return; }
+    # Обычный вывод в терминал. Текст остаётся в буфере прокрутки: его
+    # можно выделить мышью и скопировать.
+    #
+    # Открыть «с начала и читать вниз» в ленте терминала нельзя в
+    # принципе: после вывода лента стоит в самом низу, и всё напечатанное
+    # находится выше. Страничные просмотрщики это умеют, но запирают
+    # текст — пропадает выделение мышью. Кому нужно спокойное чтение,
+    # рядом есть пункт сохранения в файл.
+    view_text "$(t m_manual)" "$(cat "$f")" top
+}
+
+submenu_manual() {
+    local sel="1" ch
+    while true; do
+        ch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+             --title "$(t m_manual)" \
+             --ok-label "$(t select)" --cancel-label "$(t back)" \
+             --default-item "$sel" \
+             --menu "" $(msize 2) \
+             1 "\Z7$(t man_read)\Zn" \
+             2 "\Z2$(t man_save)\Zn" \
+             3>&1 1>&2 2>&3)"
+        [ $? -ne 0 ] && break
+        clear_all
+        [ -n "$ch" ] && sel="$ch"
+        case "$ch" in
+            1) manual_view ;;
+            2) manual_save ;;
+        esac
+    done
+}
+
+settings_export() {
+    local path home
+    home="$(user_home)"; [ -n "$home" ] || home="$HOME"
+    path="$("$DIALOG" --backtitle "$BACKTITLE" --title "$(t exp_t)" \
+           --ok-label "$(t log_save)" --cancel-label "$(t cancel)" \
+           --inputbox "$(t exp_p)" 10 70 \
+           "$home/autoswitch-settings-$(date +%Y%m%d).txt" 3>&1 1>&2 2>&3)"
+    [ $? -ne 0 ] && return
+    # dialog дописывает пробелы в конец введённой строки — без обрезки
+    # запись уходила по несуществующему пути и молча не срабатывала
+    path="$(printf '%s' "$path" | sed 's/[[:space:]]*$//')"
+    [ -n "$path" ] || return
+    {
+        echo "$EXPORT_MARK"
+        echo "# version=1  date=$(date '+%Y-%m-%d %H:%M')"
+        echo
+        echo "[config]"
+        cat "$CONFIG" 2>/dev/null
+        echo
+        echo "[learned]"
+        cat "$LEARNED" 2>/dev/null
+    } > "$path" 2>/dev/null && {
+        # файл создан от root — возвращаем владельца, иначе пользователь
+        # не сможет его ни открыть, ни удалить
+        chown "${SUDO_USER:-$USER}" "$path" 2>/dev/null || true
+        show_result "$(printf "$(t exp_ok)" "$path")"
+    } || show_result "$(t exp_err)"
+}
+
+# Последний сохранённый файл переноса — чтобы при импорте не набирать
+# путь руками: в большинстве случаев человек только что его и создал.
+last_export() {
+    local home d f
+    home="$(user_home)"; [ -n "$home" ] || home="$HOME"
+    for d in "$home" "$home/Documents" "$home/Downloads" "$home/Загрузки" \
+             "$home/Документы" /mnt/shared; do
+        [ -d "$d" ] || continue
+        f="$(ls -1t "$d"/autoswitch-settings-*.txt 2>/dev/null | head -1)"
+        [ -n "$f" ] && { printf '%s' "$f"; return; }
+    done
+    printf '%s/' "$home"
+}
+
+settings_import() {
+    local path
+    path="$("$DIALOG" --backtitle "$BACKTITLE" --title "$(t imp_t)" \
+           --ok-label "$(t select)" --cancel-label "$(t cancel)" \
+           --inputbox "$(t imp_p)" 10 70 "$(last_export)" 3>&1 1>&2 2>&3)"
+    [ $? -ne 0 ] && return
+    path="$(printf '%s' "$path" | sed 's/[[:space:]]*$//')"
+    [ -r "$path" ] || { show_result "$(t imp_bad): $path"; return; }
+    head -1 "$path" | grep -q "^$EXPORT_MARK" \
+        || { show_result "$(t imp_bad): $path"; return; }
+    d_confirm "$(t imp_t)" "$(t imp_ask)" || return
+
+    local tmpc tmpl
+    tmpc="$(mktemp)"; tmpl="$(mktemp)"
+    awk '/^\[config\]$/{s="c";next} /^\[learned\]$/{s="l";next}
+         s=="c"{print > C} s=="l"{print > L}' \
+        C="$tmpc" L="$tmpl" "$path"
+
+    # Словарь СЛИВАЕМ: свои слова остаются, принесённые добавляются и
+    # при совпадении перекрывают — человек принёс файл осознанно.
+    # Ключ уникален по построению, поэтому дубликатов не возникает.
+    local merged
+    merged="$(python3 - "$LEARNED" "$tmpl" <<'PY'
+import sys
+words = {}
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        continue
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith('#'):
+            continue
+        parts = ln.replace('\t', ' ').split()
+        if not parts:
+            continue
+        lang = parts[1].lower() if len(parts) > 1 else 'us'
+        words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
+for w in sorted(words):
+    print('%s\t%s' % (w, words[w]))
+PY
+)"
+    printf '%s\n' "$merged" | asc-helper write-learned 2>/dev/null \
+        || printf '%s\n' "$merged" | /usr/local/bin/asc-helper write-learned
+    asc-helper write-config < "$tmpc" 2>/dev/null \
+        || /usr/local/bin/asc-helper write-config < "$tmpc"
+    rm -f "$tmpc" "$tmpl"
+
+    systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+    poke_indicator
+    show_result "$(printf "$(t imp_ok)" "$(printf '%s\n' "$merged" | grep -c .)")"
+}
+
+submenu_settings() {
+    local sel="1"   # какой пункт подсвечен
+    while true; do
+        local ch
+        ch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+             --title "$(t set_title)" \
+             --default-item "$sel" \
+             --ok-label "$(t select)" --cancel-label "$(t back)" \
+             --menu "" $(msize 7) \
+             1 "\Z3$(t set_config)\Zn" \
+             2 "\Z6$(t set_excl)\Zn" \
+             3 "\Z2$(t m_techdict)\Zn" \
+             4 "\Z6$(t set_indicator)\Zn" \
+             5 "\Z5$(t set_lang)\Zn" \
+             6 "\Z2$(t set_export)\Zn" \
+             7 "\Z3$(t set_import)\Zn" \
+             3>&1 1>&2 2>&3)"
+        [ $? -ne 0 ] && break
+        clear_all
+        case "$ch" in
+            1) sel="1"; clear
+               _sb="$(md5sum "$CONFIG" 2>/dev/null)"
+               "$EDITOR_BIN" "$CONFIG"
+               _sa="$(md5sum "$CONFIG" 2>/dev/null)"
+               if [ "$_sb" = "$_sa" ]; then
+                   show_result "$(t cfg_unchanged)"
+               elif d_confirm "$(t set_title)" "$(t set_saved)"; then
+                   systemctl restart "$SERVICE"; poke_indicator; show_result "$(t r_restarting)"
+               fi ;;
+            2) sel="2"; submenu_exclusions "$@" ;;
+            3) sel="3"; submenu_techdict ;;
+            4) sel="4"
+               local curi
+               curi="$(grep -E '^show_indicator=' "$CONFIG" 2>/dev/null | cut -d= -f2)"
+               [ -z "$curi" ] && curi="on"
+               local nowi
+               if [ "$curi" = "on" ]; then nowi="$(t ind_on)"; else nowi="$(t ind_off)"; fi
+               local chi
+               chi="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                     --title "$(t ind_title)" \
+                     --ok-label "$(t select)" --cancel-label "$(t back)" \
+                     --menu "$(t ind_now): \Zb$nowi\Zn\n\n$(t ind_hint)" \
+                     $(msize 2 4) \
+                     on  "\Z2$(t ind_on)\Zn" \
+                     off "\Z3$(t ind_off)\Zn" \
+                     3>&1 1>&2 2>&3)"
+               [ $? -ne 0 ] && continue
+               if [ -n "$chi" ]; then
+                   set_cfg show_indicator "$chi"
+                   if [ "$chi" = "on" ]; then
+                       d_msg "$(t ind_title)" "$(t ind_on_done)"
+                   else
+                       d_msg "$(t ind_title)" "$(t ind_off_done)"
+                   fi
+               fi ;;
+            5) local lch
+               lch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                     --title "$(t lang_title)" \
+                     --default-item "$UI_LANG" \
+                     --ok-label "$(t select)" --cancel-label "$(t back)" \
+                     --menu "" $(msize 2) \
+                     ru "Русский" \
+                     en "English" \
+                     3>&1 1>&2 2>&3)"
+               [ $? -ne 0 ] && { sel="5"; continue; }
+               if [ -n "$lch" ]; then
+                   set_cfg ui_lang "$lch"
+                   UI_LANG="$lch"
+                   # перевыпустить конфиг на новом языке, сохранив значения
+                   _gen="/usr/local/lib/autoswitch/config_template.py"
+                   if [ -f "$_gen" ]; then
+                       _tmp="$CONFIG.tmp.$$"
+                       if python3 "$_gen" render "$lch" "$CONFIG" > "$_tmp" 2>/dev/null; then
+                           mv -f "$_tmp" "$CONFIG"
+                       else
+                           rm -f "$_tmp"
+                       fi
+                   fi
+               fi
+               sel="5"   # остаёмся в настройках, курсор на «Язык» — можно сразу сменить обратно
+               ;;
+            6) sel="6"; settings_export ;;
+            7) sel="7"; settings_import ;;
+
+        esac
+    done
+}
+
+submenu_techdict() {
+    while true; do
+           local n=0
+           [ -f "$LEARNED" ] && n=$(grep -cvE '^\s*(#|$)' "$LEARNED" 2>/dev/null)
+           local ch9
+           ch9="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                 --title "$(t td_title)" \
+                 --ok-label "$(t select)" --cancel-label "$(t back)" \
+                 --menu "$(t td_count): \Zb$n\Zn\n\n$(t td_note)" \
+                 $(msize 4 4) \
+                 1 "\Z2$(t td_add)\Zn" \
+                 2 "\Z6$(t td_view)\Zn" \
+                 3 "\Z3$(t td_edit)\Zn" \
+                 4 "\Z1$(t td_reset)\Zn" \
+                 3>&1 1>&2 2>&3)"
+           [ $? -ne 0 ] && break
+           clear_all
+           case "$ch9" in
+               1) local word
+                  word="$("$DIALOG" --backtitle "$BACKTITLE" \
+                        --title "$(t td_add_t)" \
+                        --ok-label "$(t add)" --cancel-label "$(t cancel)" \
+                        --inputbox "$(t td_add_p)" 9 54 3>&1 1>&2 2>&3)"
+                  [ $? -ne 0 ] && continue
+                  word="$(echo "$word" | tr 'A-Z' 'a-z' | tr -d ' ')"
+                  [ -z "$word" ] && continue
+                  # выбор языка, в котором слово нужно ОСТАВЛЯТЬ
+                  local wlang
+                  wlang="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                        --title "$(t td_lang_t)" \
+                        --ok-label "$(t select)" --cancel-label "$(t back)" \
+                        --menu "$(t td_lang_p)" $(msize 2 3) \
+                        us "\Z6$(t td_lang_us)\Zn" \
+                        ru "\Z5$(t td_lang_ru)\Zn" \
+                        3>&1 1>&2 2>&3)"
+                  [ $? -ne 0 ] && continue
+                  [ -z "$wlang" ] && wlang="us"
+                  [ -f "$LEARNED" ] || printf '# autoswitch: learned\n' > "$LEARNED"
+                  # в файл — US-форма, как это делает и asc-gui: иначе в
+                  # словаре смешались бы записи двух видов
+                  shown="$word"
+                  word="$(learned_to_us "$word")"
+                  if grep -qiE "^${word}[[:space:]]" "$LEARNED" 2>/dev/null; then
+                      # обновить язык у существующей записи
+                      sed -i "s#^${word}[[:space:]].*#${word}\t${wlang}#I" "$LEARNED"
+                  else
+                      printf '%s\t%s\n' "$word" "$wlang" >> "$LEARNED"
+                  fi
+                  # Перезапуск не нужен: движок следит за временем
+                  # изменения learned.txt и перечитывает его на ходу
+                  # (_refresh_learned на каждом разделителе слов).
+                  show_result "$(t td_added): $shown ($wlang)" ;;
+               2) clear; echo "=== $(t td_your) ($LEARNED) ==="; echo
+                  # Те же два блока и в том же порядке, что в окне
+                  # asc-gui: сверху абзац-пояснение, ниже комментарии
+                  # из файла. Текст взят из asc-gui дословно.
+                  printf '%b\n\n' "$(t td_hint)"
+                  printf '%b\n\n' "$(t td_file_hint)"
+                  # и слова показываем так же: «идее ru», а не хранимую
+                  # US-форму «bltt ru»
+                  if [ -f "$LEARNED" ] && [ -n "$(learned_show "$LEARNED")" ]; then
+                      learned_show "$LEARNED"
+                  else echo "  $(t td_empty)"; fi
+                  echo; read_esc_or_enter ;;
+               3) learned_edit
+                  # перезапуск не нужен — файл перечитывается на ходу
+                  # Заголовок в show_result однострочный, и печатается он
+                  # через echo без -e: "\n" попал бы в вывод буквально.
+                  # Поэтому соединяем тире, а не переносом строки.
+                  show_result "$(t td_updated) — $(t td_applied)" ;;
+               4) if d_confirm "$(t td_reset_t)" "$(t td_reset_m)"; then
+                      if d_password "$(t td_reset_pw)"; then
+                          rm -f "$LEARNED"; show_result "$(t td_reset_ok)"
+                      fi
+                  fi ;;
+           esac
+       done
+}
+
+# Журнал: показываем за сегодня, а сохранить можно целиком.
+#
+# Показывать всё подряд незачем — за пару месяцев набегают тысячи строк, и
+# нужное в них тонет. А вот сохранять надо всё: если человек присылает файл
+# с жалобой, обрезанный журнал бесполезен.
+submenu_log() {
+    local sel="1"
+    while true; do
+        local ch
+        ch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+             --title "$(t m_log)" \
+             --default-item "$sel" \
+             --ok-label "$(t select)" --cancel-label "$(t back)" \
+             --menu "" $(msize 3) \
+             1 "\Z5$(t log_view)\Zn" \
+             2 "\Z2$(t log_save)\Zn" \
+             3 "\Z1$(t log_clear)\Zn" \
+             3>&1 1>&2 2>&3)"
+        [ $? -ne 0 ] && break
+        clear_all
+        case "$ch" in
+            1) sel="1"; show_log_today ;;
+            2) sel="2"; save_log_file ;;
+            3) sel="3"; clear_log_file ;;
+        esac
+    done
+}
+
+# Очистка журнала. journald не умеет удалять записи выборочно по службе,
+# поэтому стирается весь системный журнал — предупреждаем об этом явно.
+# Нужно для приватности: при debug_log=on в журнал попадают набранные слова.
+clear_log_file() {
+    if d_confirm "$(t log_clear_t)" "$(t log_clear_q)"; then
+        : > "$LOGFILE" 2>/dev/null || true
+        show_result "$(t log_cleared)"
+    fi
+}
+
+show_log_today() {
+    local body
+    # Файла может не быть вовсе: служба ни разу не запускалась, или журнал
+    # отключён в настройках. Голая ошибка tail пугает и ничего не объясняет.
+    if [ ! -r "$LOGFILE" ]; then
+        # %b: в переводах перенос записан как \n, а view_text печатает как есть
+        view_text "$(t m_log)" "$(printf '%b' "$(t log_none)")"
+        return
+    fi
+    body="$(tail -n 400 "$LOGFILE" 2>&1)"
+    if [ -z "$body" ] || [ "$(printf '%s' "$body" | wc -l)" -lt 2 ]; then
+        # сегодня службу не трогали — покажем последние записи, чтобы экран
+        # не оказался пустым
+        body="$(tail -n 200 "$LOGFILE" 2>&1)"
+    fi
+    [ -n "$body" ] || body="$(printf '%b' "$(t log_none)")"
+    view_text "$(t m_log)" "$(printf '%s' "$body" | colorize_log)"
+}
+
+# Полный журнал в файл — чтобы приложить к вопросу.
+save_log_file() {
+    local home_dir dir dst sess_id sess_type sess_desk
+    home_dir="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
+    [ -z "$home_dir" ] && home_dir="$HOME"
+
+    # Папка по умолчанию — рядом с исходниками программы: там же лежат и
+    # сама распакованная копия, и её резервная. Всё в одном месте.
+    local def_dir="$home_dir/Applications/autoswitch-logs"
+
+    if ! d_confirm "$(t log_save)" "$(t log_save_note)"; then
+        dir="$def_dir"
+    else
+        local ch_dir
+        while true; do
+            ch_dir="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                  --title "$(t log_save)" \
+                  --ok-label "$(t select)" --cancel-label "$(t back)" \
+                  --menu "$(t log_where)" $(msize 5 1) \
+                  1 "$(t dir_default)" \
+                  2 "$(t dir_home)" \
+                  3 "$(t dir_downloads)" \
+                  4 "$(t dir_documents)" \
+                  5 "$(t dir_other)" \
+                  3>&1 1>&2 2>&3)"
+            [ $? -ne 0 ] && return 0
+            clear_all
+            case "$ch_dir" in
+                1) dir="$def_dir" ;;
+                2) dir="$home_dir" ;;
+                3) dir="$home_dir/Downloads"
+                   [ -d "$dir" ] || dir="$home_dir/Загрузки" ;;
+                4) dir="$home_dir/Documents"
+                   [ -d "$dir" ] || dir="$home_dir/Документы" ;;
+                5) # Путь вводится, а не выбирается деревом: в дереве видны
+                   # служебные каталоги вроде .ssh и .cache, а выбор папки
+                   # сразу означал сохранение — человек не успевал понять,
+                   # куда попал.
+                   dir="$("$DIALOG" --backtitle "$BACKTITLE" \
+                         --title "$(t log_save)" \
+                         --ok-label "$(t select)" --cancel-label "$(t back)" \
+                         --inputbox "$(t dir_ask)" 10 70 "$home_dir/" \
+                         3>&1 1>&2 2>&3)"
+                   [ $? -ne 0 ] && continue ;;
+                *) dir="$def_dir" ;;
+            esac
+
+            dir="${dir%/}"
+            [ -z "$dir" ] && dir="$def_dir"
+            # спрашиваем прямо: вот сюда и положим
+            d_confirm "$(t log_save)" "$(t dir_confirm)\n\n$dir" && break
+        done
+    fi
+
+    dir="${dir%/}"
+    [ -z "$dir" ] && dir="$def_dir"
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir" 2>/dev/null || dir="$home_dir"
+        # каталог создаёт root, а пользоваться им человеку: иначе папку
+        # потом не переименовать и не удалить без sudo
+        chown "${SUDO_USER:-$USER}" "$dir" 2>/dev/null
+    fi
+
+    local nlines
+    nlines="$(wc -l < "$LOGFILE" 2>/dev/null || echo 0)"
+    # число строк прямо в имени: сразу видно объём, не открывая файл
+    local dst="$dir/autoswitch-$(date +%Y%m%d-%H%M)-${nlines}.log"
+    {
+        echo "=== autoswitch: отчёт ==="
+        echo "снят: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo
+
+        echo "--- система ---"
+        uname -a
+        [ -r /etc/os-release ] && ( . /etc/os-release; echo "$PRETTY_NAME" )
+        # под sudo переменные окружения пользователя недоступны — берём у
+        # системы, иначе в отчёте всегда стоял знак вопроса
+        sess_id="$(loginctl show-user "${SUDO_USER:-$USER}" -p Display --value 2>/dev/null)"
+        sess_type="$(loginctl show-session "$sess_id" -p Type --value 2>/dev/null)"
+        sess_desk="$(loginctl show-session "$sess_id" -p Desktop --value 2>/dev/null)"
+        echo "сессия: ${sess_type:-${XDG_SESSION_TYPE:-?}}  рабочий стол: ${sess_desk:-${XDG_CURRENT_DESKTOP:-?}}"
+        echo "локаль: ${LANG:-?}"
+        echo
+
+        echo "--- установка ---"
+        # перечисляем то, что стоит; чего нет — не пишем: набор файлов
+        # зависит от окружения, и «нет» здесь читалось бы как поломка
+        for f in /usr/local/bin/asc /usr/local/bin/asc-gui \
+                 /usr/local/lib/autoswitch/autoswitch.py \
+                 /usr/local/bin/autoswitch-indicator; do
+            [ -e "$f" ] && echo "$(date -r "$f" '+%Y-%m-%d %H:%M')  $f"
+        done
+        echo
+
+        echo "--- индикатор ---"
+        # у каждого окружения своя ветка, и «нет значка» само по себе не
+        # ошибка: на KDE его роль играет апплет панели, на GNOME — расширение
+        if [ -d "$home_dir/.local/share/gnome-shell/extensions/autoswitch@shah-man.github.io" ]; then
+            echo "расширение GNOME: установлено"
+        fi
+        if [ -d "$home_dir/.local/share/plasma/plasmoids/org.shah-man.autoswitch" ]; then
+            echo "апплет KDE: установлен (отдельного значка не требуется)"
+        fi
+        if [ -x /usr/local/bin/autoswitch-indicator ]; then
+            echo "значок в трее: установлен"
+            pgrep -f autoswitch-indicator >/dev/null 2>&1 \
+                && echo "значок сейчас запущен" || echo "значок сейчас НЕ запущен"
+        fi
+        echo
+
+        echo "--- зависимости ---"
+        for c in dialog less awk; do
+            printf '%-24s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo нет)"
+        done
+        for m in evdev Xlib; do
+            if python3 -c "import $m" 2>/dev/null; then
+                printf '%-24s %s\n' "python3-$m" "есть"
+            else
+                printf '%-24s %s\n' "python3-$m" "НЕТ"
+            fi
+        done
+        for g in Gtk Vte AyatanaAppIndicator3; do
+            if python3 -c "import gi; gi.require_version('$g', '$( [ "$g" = Gtk ] && echo 3.0 || { [ "$g" = Vte ] && echo 2.91 || echo 0.1; } )')" 2>/dev/null; then
+                printf '%-24s %s\n' "$g" "есть"
+            else
+                printf '%-24s %s\n' "$g" "НЕТ"
+            fi
+        done
+        printf '%-24s %s\n' "словарь ru" \
+            "$(ls /usr/share/hunspell/ru_RU.dic 2>/dev/null || echo нет)"
+        printf '%-24s %s\n' "словарь en" \
+            "$(ls /usr/share/hunspell/en_US.dic 2>/dev/null || echo нет)"
+        echo
+
+        echo "--- раскладки ---"
+        if command -v setxkbmap >/dev/null 2>&1; then
+            setxkbmap -query 2>&1
+        else
+            echo "setxkbmap недоступен"
+        fi
+        if command -v gsettings >/dev/null 2>&1; then
+            echo "GNOME: $(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null)"
+        fi
+        echo
+
+        echo "--- клавиатуры ---"
+        # какое устройство перехватил движок и что вообще есть
+        grep -A 4 -i "keyboard" /proc/bus/input/devices 2>/dev/null \
+            | grep -E "^N:|^H:" | head -20
+        echo
+
+        echo "--- настройки ---"
+        if [ -r "$CONFIG" ]; then
+            grep -vE '^\s*(#|$)' "$CONFIG"
+        else
+            echo "нет файла $CONFIG"
+        fi
+        echo
+        echo "исключения:"
+        excl_read | sed 's/^/  /' | head -50
+        echo "  всего: $(excl_read | wc -l)"
+        echo
+        echo "своих слов: $(grep -cvE '^\s*(#|$)' "$UW" 2>/dev/null || echo 0)"
+        echo
+
+        echo "--- состояние службы ---"
+        systemctl status "$SERVICE" --no-pager 2>&1
+        echo
+
+        echo "--- последние ошибки ---"
+        grep -iE 'error|failed|ошибк|не удалось|bridge FAILED' "$LOGFILE" 2>/dev/null | tail -50 \
+            | grep -v -- "-- No entries --" || echo "ошибок нет"
+        echo
+
+        echo "--- журнал целиком ---"
+        cat "$LOGFILE" 2>&1
+    } > "$dst" 2>/dev/null
+
+    chown "${SUDO_USER:-$USER}" "$dst" 2>/dev/null
+    d_msg "$(t log_saved)" "$dst"
+}
+
+# Цвет пункта = род действия, а не украшение. Легенда одна на все меню:
+#   \Z2 зелёный   — служба идёт работать: запустить, перезапустить,
+#                  включить, добавить, сохранить в файл
+#   \Z3 жёлтый    — обратимое изменение: перезапустить, выключить,
+#                  править, импорт настроек
+#   \Z5 сиреневый — записи и режимы: журнал, индикатор
+#   \Z6 голубой   — состояние и списки: статус, автозапуск, исключения,
+#                  словарь
+#   \Z7 белый     — нейтральное: остановить, настройки, руководство.
+#                  Остановка — обычное действие пользователя, а не авария,
+#                  поэтому цвет спокойный. Так же сделано в asc-gui
+#   \Z1 красный   — ТОЛЬКО необратимое: очистить журнал, очистить словарь.
+#                  Красный в программе означает ошибку и потерю данных,
+#                  поэтому обычной остановке службы он не положен
+# Синий (\Z4) не используется: он занят фоном полосы выбора, иначе
+# выбранный пункт слился бы с ней.
+#
+# Второе правило: два соседних пункта НЕ БЫВАЮТ одного цвета, иначе список
+# читается как сплошное пятно. Поэтому внутри смысловой группы цвета
+# чередуются — например, «Запустить» и «Перезапустить» зелёные, а стоящая
+# между ними «Остановить» жёлтая.
+menu_dialog() {
+    need_root "$@"
+    # sudo пишет запрос пароля прямо в терминал, и строка остаётся висеть
+    # над меню. Права уже получены — стираем её вместе с прежним выводом.
+    clear_all
+    # какой пункт подсвечен: после возврата из журнала или статуса курсор
+    # должен остаться там, откуда уходили, а не прыгать в начало списка
+    local sel="1"
+    while true; do
+        # метка окну asc-term: показано меню
+        tty_seq '\033]0;asc:menu\007'
+        local choice
+        choice="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+            --title "$(t title_main)" \
+            --ok-label "$(t select)" --cancel-label "$(t exit)" \
+            --default-item "$sel" \
+            --menu "$(status_text)" \
+            $(msize 8 1 60) \
+            1 "\Z2$(t m_start)\Zn" \
+            2 "\Z7$(t m_stop)\Zn" \
+            3 "\Z3$(t m_restart)\Zn" \
+            4 "\Z6$(t m_autostart)\Zn" \
+            5 "\Z7$(t m_settings)\Zn" \
+            6 "\Z6$(t m_status)\Zn" \
+            7 "\Z5$(t m_log)\Zn" \
+            8 "\Z7$(t m_manual)\Zn" \
+            3>&1 1>&2 2>&3)"
+        [ $? -ne 0 ] && { clear_all; exit 0; }
+
+        # как в rn: clear ПОСЛЕ выхода из меню, перед обработкой. Меню в
+        # истории не копятся, следующий вывод (статус/подменю) ложится чисто.
+        clear_all
+
+        [ -n "$choice" ] && sel="$choice"
+
+        case "$choice" in
+            1) systemctl start   "$SERVICE"; show_result "$(t r_starting)" ;;
+            2) systemctl stop    "$SERVICE"; show_result "$(t r_stopping)" ;;
+            3) systemctl restart "$SERVICE"; poke_indicator; show_result "$(t r_restarting)" ;;
+            4) local cur
+               if is_enabled; then cur="$(t as_now_on)"; else cur="$(t as_now_off)"; fi
+               local ch2
+               ch2="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+                     --title "$(t as_title)" \
+                     --ok-label "$(t select)" --cancel-label "$(t back)" \
+                     --menu "$cur" $(msize 2 1) \
+                     1 "\Z2$(t as_enable)\Zn" \
+                     2 "\Z3$(t as_disable)\Zn" \
+                     3>&1 1>&2 2>&3)"
+               [ $? -ne 0 ] && continue
+               case "$ch2" in
+                   1) systemctl enable  "$SERVICE"; d_msg "$(t as_on_done)"  "$(t as_on_done)" ;;
+                   2) systemctl disable "$SERVICE"; d_msg "$(t as_off_done)" "$(t as_off_done)" ;;
+               esac ;;
+            5) submenu_settings ;;
+            6) view_text "$(t m_status)" \
+                   "$(systemctl status "$SERVICE" --no-pager 2>&1 | colorize_log)" top ;;
+            7) submenu_log ;;
+            8) submenu_manual ;;
+            *) : ;;
+        esac
+    done
+}
+
+case "${1:-}" in
+    "")
+        if have_dialog; then menu_dialog "$@"
+        else echo "$(t no_dialog)"; fi ;;
+    start)      cmd_start   "$@" ;;
+    stop)       cmd_stop    "$@" ;;
+    restart)    cmd_restart "$@" ;;
+    enable)     cmd_enable  "$@" ;;
+    disable)    cmd_disable "$@" ;;
+    status)     cmd_status ;;
+    log|logs)   cmd_log ;;
+    config|cfg) cmd_config  "$@" ;;
+    -h|--help|help)
+        # Установка и удаление тоже здесь: их спрашивают чаще всего, а
+        # искать архив, из которого ставили, человек будет долго. Копия
+        # исходников лежит в домашней папке, поэтому путь известен заранее.
+        # Путь к установщику печатаем, ТОЛЬКО если он там действительно
+        # лежит: под root домашняя папка другая, а при установке от root
+        # копию исходников установщик вообще не кладёт. Врать не будем.
+        _ih="$(user_home)/Applications/autoswitch/installasc"
+        [ -x "$_ih" ] || _ih="./installasc"
+        echo "asc — autoswitch control"
+        echo "  asc                     menu"
+        echo "  asc start|stop|restart  service"
+        echo "  asc status              state"
+        echo "  asc enable|disable      autostart"
+        echo "  asc config              settings"
+        echo "  asc log                 journal"
+        echo
+        if [ "$_ih" = "./installasc" ]; then
+            echo "  reinstall:  sudo ./installasc   (in the program folder)"
+        else
+            echo "  reinstall:  sudo $_ih"
+        fi
+        echo "  uninstall:  sudo $_ih --uninstall" ;;
+    *) echo "Unknown command: $1. See asc --help"; exit 1 ;;
+esac

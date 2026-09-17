@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.autoswitch"
+          path="/org/gnome/shell/extensions/autoswitch/">
+    <key name="dot-size" type="i">
+      <default>10</default>
+      <range min="6" max="16"/>
+      <summary>Размер индикатора (px)</summary>
+      <description>Диаметр индикатора в панели, в пикселях.</description>
+    </key>
+    <key name="dot-padding" type="i">
+      <default>0</default>
+      <range min="0" max="10"/>
+      <summary>Горизонтальные отступы (px)</summary>
+      <description>Отступы слева и справа от индикатора в панели, в пикселях.</description>
+    </key>
+    <key name="color-running" type="s">
+      <default>'#33d17a'</default>
+      <summary>Цвет: работает</summary>
+      <description>Цвет индикатора, когда служба autoswitch работает.</description>
+    </key>
+    <key name="color-stopped" type="s">
+      <default>'#deddda'</default>
+      <summary>Цвет: остановлен</summary>
+      <description>Цвет индикатора, когда служба остановлена пользователем.</description>
+    </key>
+    <key name="color-error" type="s">
+      <default>'#e01b24'</default>
+      <summary>Цвет: ошибка</summary>
+      <description>Цвет индикатора, когда служба упала или не запустилась.</description>
+    </key>
+  </schema>
+</schemalist>

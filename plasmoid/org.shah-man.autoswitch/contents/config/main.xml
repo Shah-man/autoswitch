@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <!-- размер и отступы точки: значения по умолчанию те же,
+         что у GNOME-расширения и у GTK-индикатора -->
+    <entry name="dotSize" type="Int">
+      <default>10</default>
+      <min>6</min>
+      <max>16</max>
+    </entry>
+    <!-- цвета состояний -->
+    <entry name="colorRunning" type="Color">
+      <default>#33d17a</default>
+    </entry>
+    <entry name="colorStopped" type="Color">
+      <default>#deddda</default>
+    </entry>
+    <entry name="colorError" type="Color">
+      <default>#e01b24</default>
+    </entry>
+    <entry name="colorUnknown" type="Color">
+      <default>#9a9996</default>
+    </entry>
+  </group>
+</kcfg>

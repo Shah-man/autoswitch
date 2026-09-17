@@ -1,0 +1,169 @@
+── How it works ───────────────────────────────────────────────
+
+The program reads keystrokes, assembles a word and decides which language
+it was typed in. If the layout is wrong, it erases the word and types it
+again in the right one.
+
+The decision comes from dictionaries, Russian and English. If a word looks
+Russian but was typed in Latin letters, the layout was wrong. Letter
+combinations count too: some only ever appear in one of the two languages.
+
+The program guesses right in the vast majority of cases, but it is not
+infallible: a short word or a rare name can be taken for the other
+language. That is what the undo is for — press Shift twice and the word
+comes back and joins the dictionary, so it will not be corrected from then
+on.
+
+The program speaks two languages, Russian and English. The language of the
+window, the console and the log can be changed at any time: the "Language"
+item in the window, or asc → Settings → Language in the console. The
+manual and the notes inside the config follow that choice.
+
+── Switching ──────────────────────────────────────────────────
+
+Automatically. The fix usually arrives on the space bar, but when the
+language is clear from the first letters the layout changes right away,
+mid-word. That is "early switching"; it is turned off with the line
+early_switch=off in the config.
+
+With a single Shift. Press and release Shift without touching anything
+else and the layout changes. This works regardless of the system shortcut;
+it is turned off with the line shift_switches_layout=off.
+
+── Undoing a correction ───────────────────────────────────────
+
+If the program got it wrong, press Shift twice in a row, or Pause. The
+word goes back as you typed it and is added to "My dictionary", so it will
+not be corrected next time.
+
+That is how the dictionary fills up — on its own, as you work. Nothing
+needs to be set up in advance.
+
+── My dictionary ──────────────────────────────────────────────
+
+A list of words that must not be switched: names, titles, work
+abbreviations. It grows from your undos and can be edited by hand: the "My
+dictionary" item in the asc-gui window, or asc → Settings → My dictionary
+in the console.
+
+The format is simple: word, space, language.
+
+    hello us    — keep it English
+    привет ru   — keep it Russian
+
+Changes apply immediately, no restart needed.
+
+── App exclusions ─────────────────────────────────────────────
+
+In a terminal, a code editor or a program console, stepping in usually
+hurts more than it helps: commands must not be switched. Add such windows
+to the exclusions — asc → Settings → Exclusions. Inside them the program
+touches nothing.
+
+Out of the box only the program’s own window is excluded: you type
+dictionary words there, and that input must not be substituted. Everything
+else, terminals included, is up to you.
+
+── The program window ─────────────────────────────────────────
+
+Any tile can be dragged with the mouse — arrange them the way that suits
+you. The order is remembered. To bring back the original one, right-click
+a tile and pick the reset item.
+
+Wherever text is shown — the log, the manual, the service status — the
+right mouse button works: copy, select all, save to file. If part of the
+text is selected, only that part is saved; if nothing is selected, the
+whole text is. The log is saved as .log, the manual as .txt.
+
+── The tray indicator ─────────────────────────────────────────
+
+Green — the service is running. Pale — stopped. Red — it failed to start.
+
+A click opens the service control menu. On any action the indicator
+briefly blinks grey, so you can see the command was taken. Dot size and
+colours are set in "Extension". The indicator itself can be switched off
+in three ways: the "Panel indicator" switch in the window settings, the
+same item in the console under asc → Settings, or the line
+show_indicator=off in the config. The service keeps running.
+
+── Two capitals ───────────────────────────────────────────────
+
+A stuck Shift gives "THis" instead of "This". The program fixes that on
+its own, nothing needs to be switched on. If it gets in the way, turn it
+off with the line fix_two_capitals=off in the config.
+
+Only words that become real dictionary words after the fix are touched, so
+abbreviations such as IDs and PCs are left alone.
+
+── Security ───────────────────────────────────────────────────
+
+Passwords are neither switched nor recorded. Input longer than six
+characters that mixes letter cases with digits or symbols is treated as a
+password and left alone. Such input never reaches the log — not even with
+verbose logging on.
+
+The same goes for card numbers and any input with digits inside: it resets
+word analysis and is not recorded.
+
+A capital letter in the middle of a word marks a password or a technical
+name. Such input is moved to Latin, because passwords are almost always
+English.
+
+── Logging ────────────────────────────────────────────────────
+
+The log is the program's own, in your home directory:
+
+    ~/Applications/autoswitch.logs/autoswitch.log
+
+Typed text never reaches the system journal (journalctl). The file is
+trimmed by size, the limit is the line log_max_size=5 (megabytes). Setting
+log_max_size=0 removes the limit — the log will grow without bound. To
+clear it: asc → Log → Clear.
+
+The normal log keeps only the outcome — which word was fixed and into
+which language. Verbose mode is switched on with the line debug_log=on: it
+adds the reasoning and is only needed when hunting a problem, the rest of
+the time it stays off — debug_log=off.
+
+A full system report for troubleshooting is collected with the "Save to
+file" button.
+
+── Settings ───────────────────────────────────────────────────
+
+The file /etc/autoswitch/config, with every key explained inside the file
+itself. Open it: asc → Settings → Config.
+
+After editing the config the service restarts by itself.
+
+── Where things live ──────────────────────────────────────────
+
+Settings and dictionary:
+
+    /etc/autoswitch/config
+    /etc/autoswitch/learned.txt
+
+The log:
+
+    ~/Applications/autoswitch.logs/autoswitch.log
+
+The sources are unpacked nearby, so the program can be reinstalled without
+an internet connection:
+
+    ~/Applications/autoswitch
+
+On a repeated install the previous contents of that folder are not lost —
+they move to autoswitch.bak next to it. That way you can go back to the
+earlier build if the new one does not suit you.
+
+Offline reinstall: go to ~/Applications/autoswitch and run sudo
+./installasc.
+
+── Moving to another computer ─────────────────────────────────
+
+Export puts the settings and "My dictionary" into a single text file.
+Import takes it on the new machine: settings are replaced, the dictionary
+is merged — your own words stay, the incoming ones are added, and on a
+clash the incoming ones win.
+
+The file is plain text, so you can open it and see what you are carrying
+over.

@@ -1,0 +1,3501 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+asc-gui — графическое управление autoswitch (полный паритет с TUI asc).
+
+Настоящее окно вместо dialog: нет хвостов/зума/пропажи шапки. Плиточная
+сетка действий, оверлей журнала/статуса, полный раздел настроек (правка
+конфига, исключения с поиском и «добавить текущее окно», индикатор,
+тех-словарь, язык), навигация клавиатурой, локализация RU/EN (перенос t()
+из asc — 123 ключа). Права берутся через pkexec.
+"""
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, Pango
+
+import atexit
+import os
+import re
+import socket
+import ctypes
+import subprocess
+import sys
+import datetime
+
+VERSION = '1.0'
+SERVICE = 'autoswitch'
+CONFIG  = '/etc/autoswitch/config'
+UW      = '/etc/autoswitch/user_words.txt'
+LEARNED = '/etc/autoswitch/learned.txt'
+# Журнал лежит рядом с исходниками, в домашней папке пользователя —
+# открыть и скопировать можно без sudo.
+LOGFILE = os.path.expanduser('~/Applications/autoswitch.logs/autoswitch.log')
+HELPER  = '/usr/local/bin/asc-helper'
+REPO    = 'github.com/Shah-man/autoswitch'
+
+# Раскладка us/ru для перевода learned-правил в человекочитаемый вид и
+# обратно. Ключ в learned.txt — US-форма (латинские клавиши), но человеку
+# показываем слово так, как оно выглядит на экране в целевой раскладке:
+# правило `bltt ru` → «идее», `hello us` → «hello».
+_KB_US = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`"
+_KB_RU = "йцукенгшщзхъфывапролджэячсмитьбю.ё"
+_US2RU = {u: r for u, r in zip(_KB_US, _KB_RU)}
+_RU2US = {r: u for u, r in zip(_KB_US, _KB_RU)}
+
+
+def us_to_display(us_form, lang):
+    """US-форма + язык → как слово выглядит на экране (для показа юзеру)."""
+    if lang == 'ru':
+        return ''.join(_US2RU.get(c, c) for c in us_form.lower())
+    return us_form.lower()
+
+
+def display_to_us(word):
+    """Слово в любой раскладке → US-форма (для сохранения в learned)."""
+    return ''.join(_RU2US.get(c, c) for c in word.lower())
+
+
+TR = {
+    'ru': {
+        'about': 'О программе',
+        'exp_title': 'Экспорт\nнастроек',
+        'imp_title': 'Импорт\nнастроек',
+        'exp_btn': 'Экспорт',
+        'imp_btn': 'Импорт',
+        'exp_hint': 'Сохранить настройки и «Мой словарь» в файл — для переноса '
+                    'на другой компьютер.',
+        'imp_hint': 'Загрузить настройки и «Мой словарь» из файла. Настройки '
+                    'заменятся, словарь дополнится.',
+        'imp_ask': 'Импортировать настройки?',
+        'imp_ask_m': 'Настройки будут заменены содержимым файла.\n'
+                     '«Мой словарь» дополнится: слова из файла имеют приоритет.\n'
+                     'Файл: {f}\n\nПродолжить?',
+        'imp_bad': 'Это не файл переноса настроек autoswitch.',
+        'imp_done': 'Импортировано. Слов в словаре: {n}. Служба перезапущена.',
+        'exp_done': 'Сохранено: {f}',
+        'add': 'Добавить',
+        'as_disable': 'Выключить',
+        'as_enable': 'Включить',
+        'as_now_off': 'сейчас: выключен',
+        'as_now_on': 'сейчас: включён',
+        'as_off_done': 'Автозапуск выключен',
+        'as_on_done': 'Автозапуск включён',
+        'done_restart': 'Служба перезапущена',
+        'done_start': 'Служба запущена',
+        'done_stop': 'Служба остановлена',
+        'as_title': 'Автозапуск',
+        'autostart': 'Автозапуск',
+        'back': 'Назад',
+        'cancel': 'Отмена',
+        'ctx_save': 'Сохранить содержимое в файл',
+        'rep_title': '=== autoswitch: отчёт ===',
+        'rep_taken': 'снят: ',
+        'rep_system': '--- система ---',
+        'rep_session': 'сессия: %s  рабочий стол: %s',
+        'rep_locale': 'локаль: ',
+        'rep_install': '--- установка ---',
+        'rep_indicator': '--- индикатор ---',
+        'rep_ext_gnome': 'расширение GNOME: %s',
+        'rep_applet_kde': 'апплет KDE: %s',
+        'rep_tray_yes': 'значок в трее: установлен',
+        'rep_tray_run': 'значок сейчас запущен',
+        'rep_tray_stop': 'значок сейчас не запущен',
+        'rep_tray_no': 'значок в трее: НЕ установлен',
+        'rep_deps': '--- зависимости ---',
+        'rep_yes': 'есть',
+        'rep_no': 'НЕТ',
+        'rep_absent': 'нет',
+        'rep_dict': 'словарь %s',
+        'rep_installed': 'установлено',
+        'rep_not_installed': 'НЕ установлено',
+        'rep_layouts': '--- раскладки ---',
+        'rep_xkb_na': 'setxkbmap недоступен',
+        'rep_keyboards': '--- клавиатуры ---',
+        'rep_settings': '--- настройки ---',
+        'rep_nofile': 'нет файла ',
+        'rep_excl': 'исключения:',
+        'rep_total': '  всего: %d',
+        'rep_ownwords': 'своих слов: %d',
+        'rep_svc': '--- состояние службы ---',
+        'rep_errors': '--- последние ошибки ---',
+        'rep_noerrors': 'ошибок нет',
+        'rep_log': '--- журнал целиком ---',
+        'details': 'подробности',
+        'dir_ask': 'Путь к папке:',
+        'dir_confirm': 'Сохранить журнал в папку:',
+        'dir_default': 'Рядом с программой (Applications)',
+        'dir_documents': 'Документы',
+        'dir_downloads': 'Загрузки',
+        'dir_home': 'Домашняя папка',
+        'dir_other': 'Другая папка...',
+        'error': 'Ошибка',
+        'ex_all': 'Все приложения',
+        'ex_added': 'Добавлено',
+        'ex_added_empty': 'Пока пусто',
+        'ex_manual': 'вручную',
+        'ex_rm_hint': '✕ — убрать из исключений',
+        'ex_toggle_tip': 'Переключить список: все приложения / добавленные',
+        'ex_toggle_view': '▶',
+        'ex_choose': 'Отметь приложения (Пробел), Enter — сохранить',
+        'ex_cur_add': 'Добавить это окно в исключения?',
+        'ex_cur_done': 'Окно добавлено в исключения.',
+        'ex_cur_got': 'Поймано окно',
+        'ex_cur_none': 'Не удалось определить окно (мост недоступен?).',
+        'ex_cur_count': 'Кликни по нужному окну… %d',
+        'ex_cur_self': 'Поймано только окно Autoswitch — кликни по чужому окну.',
+        'ex_cur_wait': 'Переключись на нужное окно за 3 сек...',
+        'ex_current': 'Добавить текущее активное окно',
+        'ex_empty': '(пусто — только дефолтные терминалы)',
+        'ex_keep': 'Снимите галочку, чтобы убрать из исключений',
+        'ex_list_hdr': 'Текущие исключения',
+        'ex_menu': 'Приложения, где autoswitch не вмешивается',
+        'ex_none': 'Список пуст. Ничего не найдено по запросу.',
+        'ex_pick': 'Выбрать из списка (поиск)',
+        'ex_saved': 'Исключения сохранены и применены',
+        'ex_search': 'Поиск (пусто = все). Enter — показать список:',
+        'ex_search_btn': 'Поиск',
+        'ex_show': 'Показать текущий список',
+        'ex_steam': 'Steam (все игры) — одной галочкой',
+        'ex_steam_all': 'клиент и все игры',
+        'ex_steam_add': 'Добавить весь Steam (клиент + все игры) в исключения?',
+        'ex_steam_off': 'Steam убран из исключений.',
+        'ex_steam_on': 'Steam добавлен в исключения (весь клиент и игры).',
+        'ex_steam_q': 'Steam сейчас в исключениях. Убрать?',
+        'ex_title': 'Исключения',
+        'ex_x11note': 'На X11 определение окна идёт через xlib.',
+        'exit': 'Выход',
+        'ind_hint': 'Цветной индикатор статуса в системной панели. Работе autoswitch не мешает — это только значок.',
+        'ind_now': 'Сейчас',
+        'ind_off': 'Скрыть индикатор',
+        'ind_off_done': 'Индикатор скрыт',
+        'ind_on': 'Показывать индикатор',
+        'ind_on_done': 'Индикатор включён',
+        'ind_title': 'Индикатор в панели',
+        'lang_changed': 'Язык изменён. Откройте меню заново.',
+        'lang_title': 'Язык интерфейса / Language',
+        'log_save': 'Сохранить в файл',
+        'log_save_note': 'Будет сохранён весь журнал службы за всё время.\\n\\nВыбрать папку?',
+        'log_saved': 'Журнал сохранён',
+        'log_view': 'Журнал (лог)',
+        'log_where': 'Куда сохранить:',
+        'm_autostart': 'Автозапуск',
+        'cfg_saved_restarted': 'Сохранено, служба перезапущена',
+        'cfg_unchanged': 'Изменений нет',
+        'ctx_copy': 'Копировать',
+        'ctx_select_all': 'Выделить всё',
+        'ctx_copied': 'Скопировано',
+        'ctx_save_sel': 'Сохранить выделенное в файл',
+        'ex_builtin_tip': 'Окно самой программы — исключено всегда',
+        'm_log': 'Журнал (лог)',
+        'log_clear': 'Очистить',
+        'log_clear_tip': 'Стереть журнал autoswitch',
+        'log_clear_t': 'Очистить журнал?',
+        'log_clear_q': 'Журнал autoswitch будет очищен безвозвратно.\n\nЛоги сохраняются в файл по пути:\n~/Applications/autoswitch.logs/autoswitch.log\n\nПродолжить?',
+        'log_cleared': 'Журнал очищен',
+        'log_clear_fail': 'Не удалось очистить журнал',
+        'm_restart': 'Перезапустить',
+        'm_settings': 'Настройки',
+        'm_start': 'Запустить',
+        'm_status': 'Статус',
+        'm_stop': 'Остановить',
+        'm_techdict': 'Мой словарь',
+        'no': 'Нет',
+        'no_dialog': 'Пакет \'dialog\' не установлен. Установи: sudo apt install dialog',
+        'off': 'выкл',
+        'ok': 'OK',
+        'on': 'вкл',
+        'pr_now': 'Сейчас',
+        'press_back': 'ESC или Enter — назад...',
+        'pw_error': 'Неверный пароль. Действие отменено.',
+        'pw_prompt': 'Введите системный пароль для подтверждения:',
+        'r_restarting': 'Перезапуск autoswitch',
+        'r_starting': 'Запуск autoswitch',
+        'r_stopping': 'Остановка autoswitch',
+        'report_note': 'Полный отчёт о программе.',
+        'restart_now': 'Перезапустить сейчас',
+        'running': 'работает',
+        'save': 'Сохранить',
+        'saved': 'Сохранено',
+        'select': 'Выбрать',
+        'set_config': 'Редактировать конфиг',
+        'set_excl': 'Исключения приложений',
+        'set_indicator': 'Индикатор в панели',
+        'set_lang': 'Язык / Language',
+        'set_saved': 'Изменения сохранены.\\nПерезапустить autoswitch сейчас?',
+        'set_title': 'Настройки',
+        'state': 'Состояние',
+        'stopped': 'остановлен',
+        'svc_running': '● Служба РАБОТАЕТ',
+        'svc_stopped': '○ Служба ОСТАНОВЛЕНА',
+        'td_add': 'Добавить слово',
+        'td_add_p': 'Введите слово (латиницей, напр. myapp):',
+        'td_add_t': 'Добавить слово',
+        'td_added': 'Добавлено',
+        'td_added_m': 'Слово добавлено.\\nПерезапустить autoswitch чтобы применить?',
+        'td_apply': 'Перезапустить autoswitch чтобы применить?',
+        'td_count': 'Ваших слов',
+        'td_edit': 'Редактировать файл',
+        'td_edited': 'Файл изменён',
+        'td_empty': '(пусто — вы ещё не добавляли слов)',
+        'td_exists': 'Уже есть',
+        'td_exists_m': 'Слово уже в словаре.',
+        'tiles_reset': 'Сбросить расположение плиток',
+        'tiles_reset_done': 'Расположение сброшено',
+        'td_hint': 'Слова-исключения: не переключаются автоматически. Формат: слово и язык через пробел — «идее ru» (русским) или «myapp us» (английским). Без языка = английское. Список пополняется сам при отмене исправлений (двойной Shift или Pause).',
+        'td_file_hint': '# Мой словарь. Формат: слово ПРОБЕЛ язык (ru или us)\n#   идее ru   — оставлять русским\n#   myapp us  — оставлять английским\n# Слово без языка = английское. Пополняется сам при отмене исправлений.',
+        'td_note': 'Эталонная база (1387 слов) неизменна.\\nЗдесь — только ваши добавления:',
+        'td_reset': 'Восстановить по умолчанию',
+        'td_reset_m': 'Все ВАШИ добавленные слова будут удалены.\\nЭталонная база (1387 слов) останется.\\n\\nПродолжить?',
+        'td_reset_ok': 'Мой словарь очищен',
+        'td_reset_pw': 'Подтверждение сброса',
+        'td_reset_t': 'Восстановить по умолчанию',
+        'td_title': 'Мой словарь',
+        'td_updated': 'Мой словарь обновлён',
+        'td_view': 'Посмотреть мои слова',
+        'td_your': 'Ваши слова',
+        'title_main': 'Autoswitch',
+        'view_hint': 'ESC и Enter — назад',
+        'yes': 'Да',
+    },
+    'en': {
+        'about': 'About',
+        'exp_title': 'Export\nsettings',
+        'imp_title': 'Import\nsettings',
+        'exp_btn': 'Export',
+        'imp_btn': 'Import',
+        'exp_hint': 'Save settings and "My dictionary" to a file — to move '
+                    'them to another computer.',
+        'imp_hint': 'Load settings and "My dictionary" from a file. Settings '
+                    'are replaced, the dictionary is merged.',
+        'imp_ask': 'Import settings?',
+        'imp_ask_m': 'Settings will be replaced with the file contents.\n'
+                     '"My dictionary" will be merged: words from the file win.\n'
+                     'File: {f}\n\nContinue?',
+        'imp_bad': 'This is not an autoswitch settings transfer file.',
+        'imp_done': 'Imported. Words in the dictionary: {n}. Service restarted.',
+        'exp_done': 'Saved: {f}',
+        'add': 'Add',
+        'as_disable': 'Disable',
+        'as_enable': 'Enable',
+        'as_now_off': 'currently: disabled',
+        'as_now_on': 'currently: enabled',
+        'as_off_done': 'Autostart disabled',
+        'as_on_done': 'Autostart enabled',
+        'done_restart': 'Service restarted',
+        'done_start': 'Service started',
+        'done_stop': 'Service stopped',
+        'as_title': 'Autostart',
+        'autostart': 'Autostart',
+        'back': 'Back',
+        'cancel': 'Cancel',
+        'ctx_save': 'Save content to file',
+        'rep_title': '=== autoswitch: report ===',
+        'rep_taken': 'taken: ',
+        'rep_system': '--- system ---',
+        'rep_session': 'session: %s  desktop: %s',
+        'rep_locale': 'locale: ',
+        'rep_install': '--- installation ---',
+        'rep_indicator': '--- indicator ---',
+        'rep_ext_gnome': 'GNOME extension: %s',
+        'rep_applet_kde': 'KDE applet: %s',
+        'rep_tray_yes': 'tray icon: installed',
+        'rep_tray_run': 'tray icon is running',
+        'rep_tray_stop': 'tray icon is not running',
+        'rep_tray_no': 'tray icon: NOT installed',
+        'rep_deps': '--- dependencies ---',
+        'rep_yes': 'yes',
+        'rep_no': 'NO',
+        'rep_absent': 'no',
+        'rep_dict': '%s dictionary',
+        'rep_installed': 'installed',
+        'rep_not_installed': 'NOT installed',
+        'rep_layouts': '--- layouts ---',
+        'rep_xkb_na': 'setxkbmap unavailable',
+        'rep_keyboards': '--- keyboards ---',
+        'rep_settings': '--- settings ---',
+        'rep_nofile': 'no file ',
+        'rep_excl': 'exclusions:',
+        'rep_total': '  total: %d',
+        'rep_ownwords': 'own words: %d',
+        'rep_svc': '--- service state ---',
+        'rep_errors': '--- recent errors ---',
+        'rep_noerrors': 'no errors',
+        'rep_log': '--- full log ---',
+        'details': 'details',
+        'dir_ask': 'Path to folder:',
+        'dir_confirm': 'Save the log to:',
+        'dir_default': 'Next to the program (Applications)',
+        'dir_documents': 'Documents',
+        'dir_downloads': 'Downloads',
+        'dir_home': 'Home folder',
+        'dir_other': 'Other folder...',
+        'error': 'Error',
+        'ex_all': 'All apps',
+        'ex_added': 'Added',
+        'ex_added_empty': 'Empty for now',
+        'ex_manual': 'manual',
+        'ex_rm_hint': '✕ — remove from exclusions',
+        'ex_toggle_tip': 'Switch list: all apps / added',
+        'ex_toggle_view': '▶',
+        'ex_choose': 'Mark apps (Space), Enter to save',
+        'ex_cur_add': 'Add this window to exclusions?',
+        'ex_cur_done': 'Window added to exclusions.',
+        'ex_cur_got': 'Captured window',
+        'ex_cur_none': 'Could not detect window (bridge unavailable?).',
+        'ex_cur_count': 'Click the target window… %d',
+        'ex_cur_self': 'Only the Autoswitch window was captured — click another window.',
+        'ex_cur_wait': 'Switch to the target window within 3 sec...',
+        'ex_current': 'Add current focused window',
+        'ex_empty': '(empty — default terminals only)',
+        'ex_keep': 'Uncheck to remove from exclusions',
+        'ex_list_hdr': 'Current exclusions',
+        'ex_menu': 'Apps where autoswitch stays silent',
+        'ex_none': 'List is empty. Nothing matched your search.',
+        'ex_pick': 'Pick from list (search)',
+        'ex_saved': 'Exclusions saved and applied',
+        'ex_search': 'Search (empty = all). Enter to list:',
+        'ex_search_btn': 'Search',
+        'ex_show': 'Show current list',
+        'ex_steam': 'Steam (all games) — one checkbox',
+        'ex_steam_all': 'client and all games',
+        'ex_steam_add': 'Exclude the whole Steam (client + all games)?',
+        'ex_steam_off': 'Steam removed from exclusions.',
+        'ex_steam_on': 'Steam added to exclusions (client and all games).',
+        'ex_steam_q': 'Steam is currently excluded. Remove it?',
+        'ex_title': 'Exclusions',
+        'ex_x11note': 'On X11 window detection uses xlib.',
+        'exit': 'Exit',
+        'ind_hint': 'Colored status dot in the system panel. Does not affect autoswitch — it is only an icon.',
+        'ind_now': 'Now',
+        'ind_off': 'Hide indicator',
+        'ind_off_done': 'Indicator hidden',
+        'ind_on': 'Show indicator',
+        'ind_on_done': 'Indicator enabled',
+        'ind_title': 'Panel indicator',
+        'lang_changed': 'Language changed. Please reopen the menu.',
+        'lang_title': 'Язык интерфейса / Language',
+        'log_save': 'Save to file',
+        'log_save_note': 'The whole service journal will be saved.\\n\\nChoose a folder?',
+        'log_saved': 'Log saved',
+        'log_view': 'Journal (log)',
+        'log_where': 'Save to:',
+        'm_autostart': 'Autostart',
+        'cfg_saved_restarted': 'Saved, service restarted',
+        'cfg_unchanged': 'No changes',
+        'ctx_copy': 'Copy',
+        'ctx_select_all': 'Select all',
+        'ctx_copied': 'Copied',
+        'ctx_save_sel': 'Save selection to file',
+        'ex_builtin_tip': 'The program\'s own window — always excluded',
+        'm_log': 'Journal (log)',
+        'log_clear': 'Clear',
+        'log_clear_tip': 'Erase the autoswitch log',
+        'log_clear_t': 'Clear the journal?',
+        'log_clear_q': 'The autoswitch log will be erased permanently.\n\nLogs are stored in:\n~/Applications/autoswitch.logs/autoswitch.log\n\nProceed?',
+        'log_cleared': 'Journal cleared',
+        'log_clear_fail': 'Failed to clear the journal',
+        'm_restart': 'Restart',
+        'm_settings': 'Settings',
+        'm_start': 'Start',
+        'm_status': 'Status',
+        'm_stop': 'Stop',
+        'm_techdict': 'My dictionary',
+        'no': 'No',
+        'no_dialog': 'Package \'dialog\' is not installed. Install: sudo apt install dialog',
+        'off': 'off',
+        'ok': 'OK',
+        'on': 'on',
+        'pr_now': 'Current',
+        'press_back': 'ESC or Enter — back...',
+        'pw_error': 'Wrong password. Action cancelled.',
+        'pw_prompt': 'Enter system password to confirm:',
+        'r_restarting': 'Restarting autoswitch',
+        'r_starting': 'Starting autoswitch',
+        'r_stopping': 'Stopping autoswitch',
+        'report_note': 'Full program report.',
+        'restart_now': 'Restart now',
+        'running': 'running',
+        'save': 'Save',
+        'saved': 'Saved',
+        'select': 'Select',
+        'set_config': 'Edit config',
+        'set_excl': 'App exclusions',
+        'set_indicator': 'Panel indicator',
+        'set_lang': 'Язык / Language',
+        'set_saved': 'Changes saved.\\nRestart autoswitch now?',
+        'set_title': 'Settings',
+        'state': 'State',
+        'stopped': 'stopped',
+        'svc_running': '● Service RUNNING',
+        'svc_stopped': '○ Service STOPPED',
+        'td_add': 'Add word',
+        'td_add_p': 'Enter a word (latin, e.g. myapp):',
+        'td_add_t': 'Add word',
+        'td_added': 'Added',
+        'td_added_m': 'Word added.\\nRestart autoswitch to apply?',
+        'td_apply': 'Restart autoswitch to apply?',
+        'td_count': 'Your words',
+        'td_edit': 'Edit file',
+        'td_edited': 'File changed',
+        'td_empty': '(empty — you haven\'t added words yet)',
+        'td_exists': 'Already exists',
+        'td_exists_m': 'Word is already in the dictionary.',
+        'tiles_reset': 'Reset tile layout',
+        'tiles_reset_done': 'Layout reset',
+        'td_hint': 'Exception words: not switched automatically. Format: word and language, e.g. "hello us" or "myapp us". No language = English. The list also grows on its own when you undo a correction (double Shift or Pause).',
+        'td_file_hint': '# My dictionary. Format: word SPACE language (ru or us)\n#   hello us  — keep in English\n#   привет ru — keep in Russian\n# Word without a language = English. Grows on its own when you undo a fix.',
+        'td_note': 'Reference base (1387 words) is fixed.\\nHere are only your additions:',
+        'td_reset': 'Reset to default',
+        'td_reset_m': 'All YOUR added words will be removed.\\nReference base (1387 words) remains.\\n\\nProceed?',
+        'td_reset_ok': 'My dictionary cleared',
+        'td_reset_pw': 'Reset confirmation',
+        'td_reset_t': 'Reset to default',
+        'td_title': 'My dictionary',
+        'td_updated': 'My dictionary updated',
+        'td_view': 'View my words',
+        'td_your': 'Your words',
+        'title_main': 'Autoswitch',
+        'view_hint': 'ESC and Enter — back',
+        'yes': 'Yes',
+    },
+}
+
+
+# ── Палитра ──────────────────────────────────────────────────────────
+BG='#000000'; FG='#e4e4e4'; CYAN='#5fffff'; GREEN='#5fff87'; RED='#ff5f5f'
+YELLOW='#ffd75f'; PURPLE='#ff5fd7'; BLUE='#87d7ff'; GRAY='#8a8a8a'
+PANEL='#0a0e0e'; TILE='#0d1414'; BORDER='#1c4a4a'; HOVER='#14201f'; FOCUS='#2a6f6f'
+
+MIN_W, MIN_H = 240, 280
+# ниже этой ширины колонки исключений показываются по очереди
+NARROW_W = 620
+# ниже этой ширины кнопки шапки показывают только значки
+COMPACT_W = 430
+STEAM_TOKENS = ['steam*', 'com.valvesoftware.steam*']
+# собственные окна — их нельзя ловить кнопкой «добавить активное окно»
+SELF_CLASSES = ['autoswitch', 'asc-gui', 'asc-term', 'asc']
+
+# Диагностика перетаскивания плиток: ASC_DND_DEBUG=1 asc-gui
+_DND_DEBUG = bool(os.environ.get('ASC_DND_DEBUG'))
+
+
+def _dbg(*a):
+    if _DND_DEBUG:
+        print('[dnd]', *a, file=sys.stderr, flush=True)
+
+
+def detect_lang():
+    v = cfg_get('ui_lang', '')
+    if v in ('ru', 'en'):
+        return v
+    return 'ru' if (os.environ.get('LANG', '').lower().startswith('ru')) else 'en'
+
+
+
+# ── рабочая область там, где панель не резервирует место ─────────────
+# LXQt (Lubuntu) не выставляет _NET_WORKAREA по панели: она равна всему
+# экрану, и окно разворачивается под панель. Считаем область сами по
+# окнам-докам. Размеры экрана и панели нигде не зашиты — берём фактические,
+# поэтому работает на любом разрешении и при панели с любой стороны.
+def dock_rects():
+    """[(x, y, w, h)] окон-панелей. Пустой список, если X11 недоступен."""
+    rects = []
+    if os.environ.get('WAYLAND_DISPLAY') and not os.environ.get('DISPLAY'):
+        return rects
+    try:
+        lib = ctypes.CDLL('libX11.so.6')
+    except OSError:
+        return rects
+    try:
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                    ctypes.c_int]
+        lib.XGetWindowProperty.restype = ctypes.c_int
+        lib.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+            ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))]
+        lib.XGetGeometry.restype = ctypes.c_int
+        lib.XGetGeometry.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+        lib.XTranslateCoordinates.restype = ctypes.c_int
+        lib.XTranslateCoordinates.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+        lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    except Exception:
+        return rects
+
+    # указатель держим как c_void_p: голый int ctypes ужимает до 32 бит,
+    # libX11 разыменовывает огрызок и процесс падает
+    dpy = ctypes.c_void_p(lib.XOpenDisplay(None))
+    if not dpy.value:
+        return rects
+    try:
+        root = lib.XDefaultRootWindow(dpy)
+        a_list = lib.XInternAtom(dpy, b'_NET_CLIENT_LIST', 1)
+        a_type = lib.XInternAtom(dpy, b'_NET_WM_WINDOW_TYPE', 1)
+        a_dock = lib.XInternAtom(dpy, b'_NET_WM_WINDOW_TYPE_DOCK', 1)
+        if not a_list or not a_type or not a_dock:
+            return rects
+
+        def prop(win, atom, want_type):
+            at = ctypes.c_ulong()
+            fmt = ctypes.c_int()
+            n = ctypes.c_ulong()
+            rest = ctypes.c_ulong()
+            data = ctypes.POINTER(ctypes.c_ubyte)()
+            rc = lib.XGetWindowProperty(
+                dpy, win, atom, 0, 4096, 0, want_type,
+                ctypes.byref(at), ctypes.byref(fmt), ctypes.byref(n),
+                ctypes.byref(rest), ctypes.byref(data))
+            if rc != 0 or not data:
+                return []
+            try:
+                if fmt.value != 32:
+                    return []
+                arr = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))
+                return [arr[i] for i in range(n.value)]
+            finally:
+                lib.XFree(data)
+
+        for win in prop(root, a_list, 33):          # 33 = XA_WINDOW
+            if a_dock not in prop(win, a_type, 4):  # 4 = XA_ATOM
+                continue
+            rr = ctypes.c_ulong()
+            x = ctypes.c_int()
+            y = ctypes.c_int()
+            w = ctypes.c_uint()
+            h = ctypes.c_uint()
+            b = ctypes.c_uint()
+            d = ctypes.c_uint()
+            if lib.XGetGeometry(dpy, win, ctypes.byref(rr), ctypes.byref(x),
+                                ctypes.byref(y), ctypes.byref(w),
+                                ctypes.byref(h), ctypes.byref(b),
+                                ctypes.byref(d)) == 0:
+                continue
+            ax = ctypes.c_int()
+            ay = ctypes.c_int()
+            child = ctypes.c_ulong()
+            if lib.XTranslateCoordinates(dpy, win, root, 0, 0,
+                                         ctypes.byref(ax), ctypes.byref(ay),
+                                         ctypes.byref(child)) == 0:
+                ax, ay = x, y
+            if w.value > 0 and h.value > 0:
+                rects.append((ax.value, ay.value, w.value, h.value))
+    except Exception:
+        pass
+    finally:
+        try:
+            lib.XCloseDisplay(dpy)
+        except Exception:
+            pass
+    return rects
+
+
+# ── Системные вызовы ─────────────────────────────────────────────────
+def run(cmd, input_text=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           input=input_text)
+        return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except Exception as e:
+        return 1, str(e)
+
+
+def svc_active():
+    return run(['systemctl', 'is-active', '--quiet', SERVICE])[0] == 0
+
+
+def svc_enabled():
+    return run(['systemctl', 'is-enabled', '--quiet', SERVICE])[0] == 0
+
+
+# Файл-маячок: способ сказать GNOME-расширению, что состояние службы
+# изменилось. Расширение — отдельная программа в составе оболочки, напрямую
+# мы к нему не достучимся, зато оно умеет следить за файлом. Трогаем маячок,
+# расширение видит изменение и коротко показывает перезапуск в панели.
+BEACON = os.path.join(GLib.get_user_runtime_dir() or '/tmp',
+                      'autoswitch.beacon')
+
+
+def poke_indicator():
+    """Сказать индикаторам обновиться прямо сейчас.
+
+    Служба перезапускается мгновенно, а индикатор опрашивает состояние раз
+    в несколько секунд — без этого сигнала он показал бы перезапуск сильно
+    позже или не заметил бы вовсе. GTK-индикатору стучимся в unix-сокет,
+    GNOME-расширению — через файл-маячок. Кого нет, тот просто не услышит.
+    """
+    try:
+        # маячок для GNOME-расширения: обновляем время файла
+        with open(BEACON, 'w') as f:
+            f.write(datetime.datetime.now().isoformat())
+    except Exception:
+        pass
+    try:
+        p = os.path.join(GLib.get_user_runtime_dir() or '/tmp',
+                         'autoswitch-indicator.sock')
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(0.5)
+        c.connect(p)
+        c.sendall(b'refresh')
+        c.close()
+    except Exception:
+        pass
+
+
+def svc_action(action):
+    # всё привилегированное — через единый asc-helper (одно polkit-действие
+    # без пароля), а не отдельным pkexec systemctl
+    res = run(['pkexec', HELPER, 'service', action])
+    poke_indicator()   # индикатор покажет новое состояние сразу
+    return res
+
+
+def svc_status_text():
+    # --lines=0: без хвоста журнала, для него есть отдельный экран
+    return run(['systemctl', 'status', SERVICE, '--no-pager',
+                '--lines=0'])[1]
+
+
+def svc_log_today():
+    # читаем СВОЙ файл журнала: в системный мы не пишем (приватность —
+    # при отладке в лог попадают набранные слова)
+    rc, out = run(['tail', '-n', '400', LOGFILE])
+    if len(out.strip().splitlines()) < 2:
+        out = run(['tail', '-n', '200', LOGFILE])[1]
+    return out
+
+
+def svc_log_all():
+    return run(['cat', LOGFILE])[1]
+
+
+def cfg_get(key, default=''):
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                if line.startswith(key + '='):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return default
+
+
+def cfg_set(key, value):
+    return run(['pkexec', HELPER, 'set-config', str(key), str(value)])[0]
+
+
+# Единственное, что исключено всегда (см. EXCLUDE_APPS в autoswitch.py) —
+# окна самой программы: в них набирают слова для словаря и классы окон.
+# В списке они показаны отмеченными, и галочку снять нельзя. Всё остальное,
+# включая терминалы, — обычные записи конфига: хочет человек переключение
+# в консоли, снимет галочку.
+BUILTIN_EXCLUDES = {'autoswitch', 'asc-gui'}
+
+
+def is_builtin_excluded(cls):
+    """Исключено ли окно встроенным списком движка (без учёта конфига)."""
+    c = (cls or '').strip().lower()
+    if not c:
+        return False
+    return c in BUILTIN_EXCLUDES or c.rsplit('.', 1)[-1] in BUILTIN_EXCLUDES
+
+
+def excl_read():
+    raw = cfg_get('exclude_apps', '')
+    return [t.strip().lower() for t in raw.split(',') if t.strip()]
+
+
+def excl_write(tokens):
+    """Записать список исключений и перезапустить службу.
+
+    Движок читает exclude_apps только при старте, поэтому без перезапуска
+    новое приложение остаётся в списке лишь на бумаге — легко решить, что
+    исключения не работают.
+    """
+    joined = ','.join(dict.fromkeys([t for t in tokens if t]))
+    ok = cfg_set('exclude_apps', joined)
+    run(['pkexec', HELPER, 'service', 'restart'])
+    poke_indicator()
+    return ok
+
+
+def scan_desktops():
+    dirs = ['/usr/share/applications', '/usr/local/share/applications',
+            os.path.expanduser('~/.local/share/applications')]
+    out = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if not fn.endswith('.desktop'):
+                continue
+            path = os.path.join(d, fn)
+            name = cls = ''
+            nodisplay = False
+            try:
+                with open(path, errors='ignore') as f:
+                    for line in f:
+                        if line.startswith('NoDisplay=true'):
+                            nodisplay = True
+                        elif line.startswith('Name=') and not name:
+                            name = line.split('=', 1)[1].strip()
+                        elif line.startswith('StartupWMClass='):
+                            cls = line.split('=', 1)[1].strip()
+            except Exception:
+                continue
+            if nodisplay:
+                continue
+            if not cls:
+                cls = fn[:-8]
+            cls = cls.lower()
+            if not name:
+                name = cls
+            out[cls] = name
+    return sorted(out.items(), key=lambda kv: kv[1].lower())
+
+
+def current_window_class():
+    """Класс активного окна: KWin-файл → GNOME-мост → X11 xprop."""
+    uid = os.getuid()
+    ff = '/run/user/%d/autoswitch-focus' % uid
+    try:
+        if os.path.isfile(ff):
+            with open(ff) as f:
+                cls = f.read().strip().lower()
+            if cls:
+                return cls
+    except Exception:
+        pass
+    # GNOME мост
+    r = run(['gdbus', 'call', '--session', '-d', 'org.gnome.Shell',
+             '-o', '/org/gnome/Shell/Extensions/AutoswitchFocus',
+             '-m', 'org.gnome.Shell.Extensions.AutoswitchFocus.GetFocusedClass'])
+    if r[0] == 0:
+        m = re.search(r"'([^']*)'", r[1])
+        if m and m.group(1):
+            return m.group(1).lower()
+    # X11
+    if run(['sh', '-c', 'command -v xprop'])[0] == 0:
+        aw = run(['xprop', '-root', '_NET_ACTIVE_WINDOW'])[1]
+        m = re.search(r'#\s*(0x[0-9a-fA-F]+)', aw)
+        if m and m.group(1) != '0x0':
+            wc = run(['xprop', '-id', m.group(1), 'WM_CLASS'])[1]
+            m2 = re.search(r'"([^"]*)"[^"]*$', wc)
+            if m2:
+                return m2.group(1).lower()
+    return ''
+
+
+# ── Диагностический отчёт (порт save_log_file из asc) ────────────────
+def diag_report(t):
+    """Диагностический отчёт. t — переводчик из окна (self.t), чтобы
+    отчёт был на языке интерфейса, а не всегда по-русски."""
+    home = os.path.expanduser('~')
+    L = []
+    L.append(t('rep_title'))
+    L.append(t('rep_taken') + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    L.append('')
+    L.append(t('rep_system'))
+    L.append(run(['uname', '-a'])[1].strip())
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('PRETTY_NAME='):
+                    L.append(line.split('=', 1)[1].strip().strip('"'))
+    except Exception:
+        pass
+    L.append(t('rep_session')
+             % (os.environ.get('XDG_SESSION_TYPE', '?'),
+                os.environ.get('XDG_CURRENT_DESKTOP', '?')))
+    L.append(t('rep_locale') + os.environ.get('LANG', '?'))
+    L.append('')
+    L.append(t('rep_install'))
+    for f in ('/usr/local/bin/asc', '/usr/local/bin/asc-gui',
+              '/usr/local/lib/autoswitch/autoswitch.py',
+              '/usr/local/bin/autoswitch-indicator'):
+        if os.path.exists(f):
+            mt = datetime.datetime.fromtimestamp(os.path.getmtime(f))
+            L.append(mt.strftime('%Y-%m-%d %H:%M') + '  ' + f)
+    L.append('')
+    L.append(t('rep_indicator'))
+    desk = (os.environ.get('XDG_CURRENT_DESKTOP', '') or '').lower()
+    gnome_ext = os.path.isdir(home + '/.local/share/gnome-shell/extensions/'
+                              'autoswitch@shah-man.github.io')
+    kde_applet = os.path.isdir(home + '/.local/share/plasma/plasmoids/'
+                               'org.shah-man.autoswitch')
+    if 'gnome' in desk:
+        L.append(t('rep_ext_gnome')
+                 % (t('rep_installed') if gnome_ext else t('rep_not_installed')))
+    elif 'kde' in desk or 'plasma' in desk:
+        L.append(t('rep_applet_kde')
+                 % (t('rep_installed') if kde_applet else t('rep_not_installed')))
+    else:
+        if os.access('/usr/local/bin/autoswitch-indicator', os.X_OK):
+            running = run(['pgrep', '-f', 'autoswitch-indicator'])[0] == 0
+            L.append(t('rep_tray_yes'))
+            L.append(t('rep_tray_run') if running
+                     else t('rep_tray_stop'))
+        else:
+            L.append(t('rep_tray_no'))
+    L.append('')
+    L.append(t('rep_deps'))
+    for c in ('dialog', 'less', 'awk'):
+        path = run(['sh', '-c', 'command -v %s' % c])[1].strip()
+        L.append('%-24s %s' % (c, path or t('rep_absent')))
+    for m in ('evdev', 'Xlib'):
+        ok = run(['python3', '-c', 'import %s' % m])[0] == 0
+        L.append('%-24s %s' % ('python3-' + m, t('rep_yes') if ok else t('rep_no')))
+    for g, ver in (('Gtk', '3.0'), ('Vte', '2.91'),
+                   ('AyatanaAppIndicator3', '0.1')):
+        ok = run(['python3', '-c',
+                  "import gi; gi.require_version('%s','%s')" % (g, ver)])[0] == 0
+        L.append('%-24s %s' % (g, t('rep_yes') if ok else t('rep_no')))
+    for name, p in ((t('rep_dict') % 'ru', '/usr/share/hunspell/ru_RU.dic'),
+                    (t('rep_dict') % 'en', '/usr/share/hunspell/en_US.dic')):
+        L.append('%-24s %s' % (name, p if os.path.exists(p) else t('rep_absent')))
+    L.append('')
+    L.append(t('rep_layouts'))
+    xkb = run(['setxkbmap', '-query'])
+    L.append(xkb[1].strip() if xkb[0] == 0 else t('rep_xkb_na'))
+    gs = run(['gsettings', 'get', 'org.gnome.desktop.input-sources', 'sources'])
+    if gs[0] == 0:
+        L.append('GNOME: ' + gs[1].strip())
+    L.append('')
+    L.append(t('rep_keyboards'))
+    try:
+        with open('/proc/bus/input/devices') as f:
+            for b in f.read().split('\n\n'):
+                if 'eyboard' in b:
+                    for line in b.splitlines():
+                        if line.startswith(('N:', 'H:')):
+                            L.append(line)
+    except Exception:
+        pass
+    L.append('')
+    L.append(t('rep_settings'))
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith('#'):
+                    L.append(s)
+    except Exception:
+        L.append(t('rep_nofile') + CONFIG)
+    L.append('')
+    L.append(t('rep_excl'))
+    ex = excl_read()
+    # переменная цикла НЕ должна называться t: это имя занято переводчиком,
+    # и после цикла вызов t('...') падал с «str object is not callable»
+    for item in ex[:50]:
+        L.append('  ' + item)
+    L.append(t('rep_total') % len(ex))
+    L.append('')
+    try:
+        with open(LEARNED) as f:
+            nw = sum(1 for ln in f
+                     if ln.strip() and not ln.strip().startswith('#'))
+    except Exception:
+        nw = 0
+    L.append(t('rep_ownwords') % nw)
+    L.append('')
+    L.append(t('rep_svc'))
+    L.append(svc_status_text().strip())
+    L.append('')
+    L.append(t('rep_errors'))
+    warn = run(['grep', '-iE', 'error|failed|ошибк|не удалось|bridge FAILED',
+                LOGFILE])[1].strip()
+    warn = '\n'.join(warn.splitlines()[-50:])
+    L.append(warn if warn.strip() else t('rep_noerrors'))
+    L.append('')
+    L.append(t('rep_log'))
+    L.append(svc_log_all().strip())
+    return '\n'.join(L) + '\n'
+
+
+
+
+# Руководство пользователя — показывается в «О программе» сразу под
+# описанием. Живёт внутри программы, а не на сайте: человек не должен
+# лезть в интернет, чтобы понять, чем пользуется. Оба языка.
+MANUAL_RU = (
+    'РУКОВОДСТВО\n'
+    '\n'
+    '── Как это работает ───────────────────────────────────────────\n'
+    '\n'
+    'Программа читает нажатия клавиш, собирает из них слово и решает, на каком языке оно набрано. Если раскладка не та — стирает слово и печатает заново в правильной.\n'
+    '\n'
+    'Решение принимается по словарям: русскому и английскому. Если слово похоже на русское, а набрано латиницей — значит раскладка не та. Учитываются и сочетания букв: «ыва» бывает только в русском, «the» — только в английском.\n'
+    '\n'
+    'Программа угадывает верно в подавляющем большинстве случаев, но не всесильна: короткое слово или редкое имя иногда можно принять за другой язык. Для таких случаев есть отмена двойным Shift — слово вернётся и попадёт в словарь, чтобы впредь оно не исправлялось.\n'
+    '\n'
+    'Программа двуязычная: русский и английский. Язык окна, консоли и журнала переключается в любой момент: в окне пункт «Язык», в консоли asc → Настройки → Язык. Руководство и пояснения в конфиге следуют за этим выбором.\n'
+    '\n'
+    '── Переключение ───────────────────────────────────────────────\n'
+    '\n'
+    'Автоматически. Обычно поправка приходит на пробеле, но если язык понятен с первых букв — раскладка меняется сразу, посреди слова. Это «раннее переключение», в конфиге оно выключается строкой early_switch=off.\n'
+    '\n'
+    'Одиночным Shift. Нажали и отпустили Shift, ничего больше не трогая — раскладка сменилась. Работает независимо от системной комбинации, выключается строкой shift_switches_layout=off.\n'
+    '\n'
+    '── Отмена исправления ─────────────────────────────────────────\n'
+    '\n'
+    'Программа ошиблась — нажмите Shift дважды подряд или Pause. Слово вернётся как было, а заодно попадёт в «Мой словарь»: в следующий раз оно уже не будет исправлено.\n'
+    '\n'
+    'Так словарь и наполняется — сам, по ходу работы. Ничего настраивать заранее не нужно.\n'
+    '\n'
+    '── Мой словарь ────────────────────────────────────────────────\n'
+    '\n'
+    'Список слов, которые не надо переключать: имена, названия, рабочие сокращения. Пополняется отменами и правится вручную: в окне asc-gui пункт «Мой словарь», в консоли asc → Настройки → Мой словарь.\n'
+    '\n'
+    'Формат простой: слово, пробел, язык.\n'
+    '\n'
+    '    идее ru    — оставлять русским\n'
+    '    myapp us   — оставлять английским\n'
+    '\n'
+    'Изменения применяются сразу, перезапуск не нужен.\n'
+    '\n'
+    '── Исключения приложений ──────────────────────────────────────\n'
+    '\n'
+    'В терминале, редакторе кода или консоли программы вмешательство чаще мешает, чем помогает: команды не переключаются. Добавьте такие окна в исключения — asc → Настройки → Исключения. В них программа не трогает ничего.\n'
+    '\n'
+    'По умолчанию исключено только окно самой программы: в нём набирают слова для словаря, и подменять этот ввод нельзя. Всё остальное, включая терминалы, решаете вы.\n'
+    '\n'
+    '── Окно программы ─────────────────────────────────────────────\n'
+    '\n'
+    'Любые плитки перетаскиваются мышью — расставьте их так, как удобно вам. Порядок запоминается. Вернуть исходный можно правой кнопкой на плитке, пункт сброса.\n'
+    '\n'
+    'Там, где показан текст — журнал, руководство, состояние службы, — работает правая кнопка мыши: копировать, выделить всё, сохранить в файл. Если часть текста выделена, сохранится только она, если ничего не выделено — весь текст. Журнал сохраняется как .log, руководство как .txt.\n'
+    '\n'
+    '── Индикатор в панели ─────────────────────────────────────────\n'
+    '\n'
+    'Зелёный — служба работает. Светлый — остановлена. Красный — ошибка запуска.\n'
+    '\n'
+    'Щелчок открывает меню управления службой. При действии индикатор коротко мигает серым — видно, что команда принята. Размер точки и цвета настраиваются в «Расширении». Сам индикатор можно выключить тремя способами: переключателем «Индикатор в панели» в настройках окна, тем же пунктом в консоли asc → Настройки, или строкой show_indicator=off в конфиге. Служба при этом продолжает работать.\n'
+    '\n'
+    '── Две заглавные ──────────────────────────────────────────────\n'
+    '\n'
+    'Залипший Shift даёт «ПРивет» вместо «Привет». Программа чинит это сама, ничего включать не нужно. Если мешает — выключается строкой fix_two_capitals=off в конфиге.\n'
+    '\n'
+    'Исправляется только то, что после починки становится словарным словом. Поэтому сокращения вроде IDs и PCs остаются как есть.\n'
+    '\n'
+    '── Безопасность ───────────────────────────────────────────────\n'
+    '\n'
+    'Пароли не переключаются и не записываются. Набор длиннее шести знаков, где есть буквы разного регистра вместе с цифрами или знаками, считается паролем: программа отходит в сторону. Такой набор не попадает в журнал никогда — даже при включённой отладке.\n'
+    '\n'
+    'То же с номерами карт и любыми наборами с цифрами внутри: они сбрасывают разбор слова и не записываются.\n'
+    '\n'
+    'Заглавная буква посреди слова — признак пароля или служебного имени. Такой набор уводится в латиницу, потому что пароли почти всегда английские.\n'
+    '\n'
+    '── Логирование ────────────────────────────────────────────────\n'
+    '\n'
+    'Журнал ведётся свой, в домашней папке пользователя:\n'
+    '\n'
+    '    ~/Applications/autoswitch.logs/autoswitch.log\n'
+    '\n'
+    'В системный журнал (journalctl) набранный текст не попадает. Файл обрезается по размеру, предел задаётся строкой log_max_size=5 (мегабайты). Значение log_max_size=0 снимает предел — журнал будет расти без ограничения. Очистить: asc → Журнал → Очистить.\n'
+    '\n'
+    'Обычный журнал хранит только итог разбора — какое слово и на какой язык поправлено. Подробный режим включается строкой debug_log=on: он добавляет ход рассуждений и нужен лишь при поиске неполадок, обычно его держат выключенным — debug_log=off.\n'
+    '\n'
+    'Полный отчёт о системе для разбора неполадок собирается кнопкой «Сохранить в файл».\n'
+    '\n'
+    '── Настройки ──────────────────────────────────────────────────\n'
+    '\n'
+    'Файл /etc/autoswitch/config, у каждого ключа пояснение прямо в файле. Открыть: asc → Настройки → Конфиг.\n'
+    '\n'
+    'После правки конфига служба перезапускается сама.\n'
+    '\n'
+    '── Где что лежит ──────────────────────────────────────────────\n'
+    '\n'
+    'Настройки и словарь:\n'
+    '\n'
+    '    /etc/autoswitch/config\n'
+    '    /etc/autoswitch/learned.txt\n'
+    '\n'
+    'Журнал:\n'
+    '\n'
+    '    ~/Applications/autoswitch.logs/autoswitch.log\n'
+    '\n'
+    'Исходники раскладываются рядом, чтобы программу можно было переустановить без интернета:\n'
+    '\n'
+    '    ~/Applications/autoswitch\n'
+    '\n'
+    'При повторной установке прежнее содержимое этой папки не пропадает, а переносится в autoswitch.bak — рядом. Так можно вернуться к прошлой сборке, если новая чем-то не подошла.\n'
+    '\n'
+    'Переустановка без сети: зайти в ~/Applications/autoswitch и запустить sudo ./installasc.\n'
+    '\n'
+    '── Перенос на другой компьютер ────────────────────────────────\n'
+    '\n'
+    'Экспорт складывает настройки и «Мой словарь» в один текстовый файл. На новой машине импорт его принимает: настройки заменяются, словарь дополняется — свои слова остаются, принесённые добавляются, при совпадении побеждают принесённые.\n'
+    '\n'
+    'Файл обычный текстовый, его можно открыть и посмотреть.\n'
+)
+
+MANUAL_EN = (
+    'USER MANUAL\n'
+    '\n'
+    '── How it works ───────────────────────────────────────────────\n'
+    '\n'
+    'The program reads keystrokes, assembles a word and decides which language it was typed in. If the layout is wrong, it erases the word and types it again in the right one.\n'
+    '\n'
+    'The decision comes from dictionaries, Russian and English. If a word looks Russian but was typed in Latin letters, the layout was wrong. Letter combinations count too: some only ever appear in one of the two languages.\n'
+    '\n'
+    'The program guesses right in the vast majority of cases, but it is not infallible: a short word or a rare name can be taken for the other language. That is what the undo is for — press Shift twice and the word comes back and joins the dictionary, so it will not be corrected from then on.\n'
+    '\n'
+    'The program speaks two languages, Russian and English. The language of the window, the console and the log can be changed at any time: the "Language" item in the window, or asc → Settings → Language in the console. The manual and the notes inside the config follow that choice.\n'
+    '\n'
+    '── Switching ──────────────────────────────────────────────────\n'
+    '\n'
+    'Automatically. The fix usually arrives on the space bar, but when the language is clear from the first letters the layout changes right away, mid-word. That is "early switching"; it is turned off with the line early_switch=off in the config.\n'
+    '\n'
+    'With a single Shift. Press and release Shift without touching anything else and the layout changes. This works regardless of the system shortcut; it is turned off with the line shift_switches_layout=off.\n'
+    '\n'
+    '── Undoing a correction ───────────────────────────────────────\n'
+    '\n'
+    'If the program got it wrong, press Shift twice in a row, or Pause. The word goes back as you typed it and is added to "My dictionary", so it will not be corrected next time.\n'
+    '\n'
+    'That is how the dictionary fills up — on its own, as you work. Nothing needs to be set up in advance.\n'
+    '\n'
+    '── My dictionary ──────────────────────────────────────────────\n'
+    '\n'
+    'A list of words that must not be switched: names, titles, work abbreviations. It grows from your undos and can be edited by hand: the "My dictionary" item in the asc-gui window, or asc → Settings → My dictionary in the console.\n'
+    '\n'
+    'The format is simple: word, space, language.\n'
+    '\n'
+    '    hello us    — keep it English\n'
+    '    привет ru   — keep it Russian\n'
+    '\n'
+    'Changes apply immediately, no restart needed.\n'
+    '\n'
+    '── App exclusions ─────────────────────────────────────────────\n'
+    '\n'
+    'In a terminal, a code editor or a program console, stepping in usually hurts more than it helps: commands must not be switched. Add such windows to the exclusions — asc → Settings → Exclusions. Inside them the program touches nothing.\n'
+    '\n'
+    'Out of the box only the program’s own window is excluded: you type dictionary words there, and that input must not be substituted. Everything else, terminals included, is up to you.\n'
+    '\n'
+    '── The program window ─────────────────────────────────────────\n'
+    '\n'
+    'Any tile can be dragged with the mouse — arrange them the way that suits you. The order is remembered. To bring back the original one, right-click a tile and pick the reset item.\n'
+    '\n'
+    'Wherever text is shown — the log, the manual, the service status — the right mouse button works: copy, select all, save to file. If part of the text is selected, only that part is saved; if nothing is selected, the whole text is. The log is saved as .log, the manual as .txt.\n'
+    '\n'
+    '── The tray indicator ─────────────────────────────────────────\n'
+    '\n'
+    'Green — the service is running. Pale — stopped. Red — it failed to start.\n'
+    '\n'
+    'A click opens the service control menu. On any action the indicator briefly blinks grey, so you can see the command was taken. Dot size and colours are set in "Extension". The indicator itself can be switched off in three ways: the "Panel indicator" switch in the window settings, the same item in the console under asc → Settings, or the line show_indicator=off in the config. The service keeps running.\n'
+    '\n'
+    '── Two capitals ───────────────────────────────────────────────\n'
+    '\n'
+    'A stuck Shift gives "THis" instead of "This". The program fixes that on its own, nothing needs to be switched on. If it gets in the way, turn it off with the line fix_two_capitals=off in the config.\n'
+    '\n'
+    'Only words that become real dictionary words after the fix are touched, so abbreviations such as IDs and PCs are left alone.\n'
+    '\n'
+    '── Security ───────────────────────────────────────────────────\n'
+    '\n'
+    'Passwords are neither switched nor recorded. Input longer than six characters that mixes letter cases with digits or symbols is treated as a password and left alone. Such input never reaches the log — not even with verbose logging on.\n'
+    '\n'
+    'The same goes for card numbers and any input with digits inside: it resets word analysis and is not recorded.\n'
+    '\n'
+    'A capital letter in the middle of a word marks a password or a technical name. Such input is moved to Latin, because passwords are almost always English.\n'
+    '\n'
+    '── Logging ────────────────────────────────────────────────────\n'
+    '\n'
+    "The log is the program's own, in your home directory:\n"
+    '\n'
+    '    ~/Applications/autoswitch.logs/autoswitch.log\n'
+    '\n'
+    'Typed text never reaches the system journal (journalctl). The file is trimmed by size, the limit is the line log_max_size=5 (megabytes). Setting log_max_size=0 removes the limit — the log will grow without bound. To clear it: asc → Log → Clear.\n'
+    '\n'
+    'The normal log keeps only the outcome — which word was fixed and into which language. Verbose mode is switched on with the line debug_log=on: it adds the reasoning and is only needed when hunting a problem, the rest of the time it stays off — debug_log=off.\n'
+    '\n'
+    'A full system report for troubleshooting is collected with the "Save to file" button.\n'
+    '\n'
+    '── Settings ───────────────────────────────────────────────────\n'
+    '\n'
+    'The file /etc/autoswitch/config, with every key explained inside the file itself. Open it: asc → Settings → Config.\n'
+    '\n'
+    'After editing the config the service restarts by itself.\n'
+    '\n'
+    '── Where things live ──────────────────────────────────────────\n'
+    '\n'
+    'Settings and dictionary:\n'
+    '\n'
+    '    /etc/autoswitch/config\n'
+    '    /etc/autoswitch/learned.txt\n'
+    '\n'
+    'The log:\n'
+    '\n'
+    '    ~/Applications/autoswitch.logs/autoswitch.log\n'
+    '\n'
+    'The sources are unpacked nearby, so the program can be reinstalled without an internet connection:\n'
+    '\n'
+    '    ~/Applications/autoswitch\n'
+    '\n'
+    'On a repeated install the previous contents of that folder are not lost — they move to autoswitch.bak next to it. That way you can go back to the earlier build if the new one does not suit you.\n'
+    '\n'
+    'Offline reinstall: go to ~/Applications/autoswitch and run sudo ./installasc.\n'
+    '\n'
+    '── Moving to another computer ─────────────────────────────────\n'
+    '\n'
+    'Export puts the settings and "My dictionary" into a single text file. Import takes it on the new machine: settings are replaced, the dictionary is merged — your own words stay, the incoming ones are added, and on a clash the incoming ones win.\n'
+    '\n'
+    'The file is plain text, so you can open it and see what you are carrying over.\n'
+)
+
+
+
+class AscGui(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='Autoswitch')
+        self.lang = detect_lang()
+        # запомненный размер окна
+        w, h = self._load_size()
+        self.set_default_size(w, h)
+        self._normal_size = (w, h)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_icon_name('autoswitch')
+        geo = Gdk.Geometry()
+        geo.min_width, geo.min_height = MIN_W, MIN_H
+        self.set_geometry_hints(None, geo, Gdk.WindowHints.MIN_SIZE)
+        self._apply_css()
+        # Свой заголовок (CSD) нужен там, где системный рисуется светлой
+        # темой WM и текст в нём почти не виден. На KDE так делать нельзя:
+        # KWin рисует нормальный тёмный заголовок сам, а кнопки GTK-шапки
+        # там остаются пустыми квадратами — значков для них в теме нет.
+        desk = (os.environ.get('XDG_CURRENT_DESKTOP', '')
+                + ' ' + os.environ.get('XDG_SESSION_DESKTOP', '')).upper()
+        self._own_titlebar = 'KDE' not in desk and 'PLASMA' not in desk
+        try:
+            if not self._own_titlebar:
+                raise RuntimeError('оставляем заголовок оконному менеджеру')
+            hb = Gtk.HeaderBar()
+            hb.set_show_close_button(True)
+            hb.set_title('Autoswitch')
+            hb.get_style_context().add_class('titlebar')
+            self.set_titlebar(hb)
+            self.headerbar = hb
+        except Exception:
+            self.headerbar = None
+        self.tiles = []
+        self.focus_idx = 0
+        self._save_id = None
+        self._about_mode = False
+        self._nav = ['main']   # стек истории экранов, как уровни меню в asc
+        self._grids = {}       # имя сетки -> (Gtk.Grid, список плиток)
+        self._compact = []     # подписи кнопок шапки: полная / значок
+        self._is_compact = None
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+        self.overlay = Gtk.Overlay()
+        self.overlay.add(self.stack)
+        self.add(self.overlay)
+        # тост-сообщение (всплывает снизу по центру, само гаснет)
+        self.toast = Gtk.Label()
+        self.toast.get_style_context().add_class('toast')
+        self.toast.set_halign(Gtk.Align.CENTER)
+        self.toast.set_valign(Gtk.Align.END)
+        self.toast.set_margin_bottom(30)
+        self.toast.set_no_show_all(True)
+        self.overlay.add_overlay(self.toast)
+        self._toast_id = None
+        self._build_all()
+
+        self.connect('key-press-event', self._on_key)
+        self.connect('configure-event', self._on_resize)
+        self.refresh_status()
+        GLib.timeout_add_seconds(2, self._tick)
+        GLib.idle_add(self._focus_tile, 0)
+
+    # ── язык ──────────────────────────────────────────────────────────
+    def t(self, key):
+        return TR.get(self.lang, TR['ru']).get(key, TR['ru'].get(key, key))
+
+    # ── запоминание размера окна ──────────────────────────────────────
+    def _order_file(self):
+        d = os.path.expanduser('~/.config/autoswitch')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(d, 'gui-tiles')
+
+    def _load_order(self, name):
+        try:
+            with open(self._order_file()) as f:
+                for line in f:
+                    k, _, v = line.strip().partition('=')
+                    if k == name and v:
+                        return v.split(',')
+        except Exception:
+            pass
+        return []
+
+    def _save_order(self, name, keys):
+        data = {}
+        try:
+            with open(self._order_file()) as f:
+                for line in f:
+                    k, _, v = line.strip().partition('=')
+                    if k:
+                        data[k] = v
+        except Exception:
+            pass
+        data[name] = ','.join(keys)
+        try:
+            with open(self._order_file(), 'w') as f:
+                for k, v in data.items():
+                    f.write('%s=%s\n' % (k, v))
+        except Exception:
+            pass
+
+    def _apply_order(self, name, items):
+        """items: список (ключ, ...). Порядок пользователя, новые — в конец."""
+        saved = self._load_order(name)
+        if not saved:
+            return items
+        by_key = {it[0]: it for it in items}
+        out = [by_key.pop(k) for k in saved if k in by_key]
+        out.extend(it for it in items if it[0] in by_key)
+        return out
+
+    def attach_ipc(self, srv):
+        """Слушаем сокет: вторая копия просит поднять это окно."""
+        self._ipc = srv
+        GLib.io_add_watch(srv.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                          self._on_ipc)
+
+    def _on_ipc(self, *_a):
+        try:
+            conn, _addr = self._ipc.accept()
+            conn.recv(64)
+            conn.close()
+        except Exception:
+            pass
+        try:
+            self.deiconify()
+            self.present_with_time(Gdk.CURRENT_TIME)
+        except Exception:
+            pass
+        return True
+
+    def _size_file(self):
+        d = os.path.expanduser('~/.config/autoswitch')
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(d, 'gui-size')
+
+    def _real_workarea(self):
+        """Рабочая область текущего монитора с учётом панелей.
+
+        Сначала спрашиваем систему. Если она отдаёт весь экран (LXQt так и
+        делает — панель место не резервирует), вычитаем панели сами.
+        Ничего не зашито: размеры берутся у монитора и у самих панелей,
+        поэтому работает на любом экране и при панели с любой стороны.
+        """
+        try:
+            disp = Gdk.Display.get_default()
+            mon = None
+            try:
+                gw = self.get_window()
+                if gw is not None:
+                    mon = disp.get_monitor_at_window(gw)
+            except Exception:
+                mon = None
+            if mon is None:
+                mon = disp.get_primary_monitor() or disp.get_monitor(0)
+            geo = mon.get_geometry()
+            wa = mon.get_workarea()
+        except Exception:
+            return None
+
+        x, y = wa.x, wa.y
+        w, h = wa.width, wa.height
+        if w <= 0 or h <= 0:
+            return None
+        # система уже учла панели — доверяем ей
+        if w < geo.width or h < geo.height:
+            return (x, y, w, h)
+
+        top = bottom = left = right = 0
+        for (px, py, pw, ph) in dock_rects():
+            # панель считаем только если она на этом мониторе
+            if px + pw <= geo.x or px >= geo.x + geo.width:
+                continue
+            if py + ph <= geo.y or py >= geo.y + geo.height:
+                continue
+            if pw >= ph:                       # горизонтальная панель
+                if py <= geo.y + geo.height / 2:
+                    top = max(top, py + ph - geo.y)
+                else:
+                    bottom = max(bottom, geo.y + geo.height - py)
+            else:                              # вертикальная
+                if px <= geo.x + geo.width / 2:
+                    left = max(left, px + pw - geo.x)
+                else:
+                    right = max(right, geo.x + geo.width - px)
+        if not (top or bottom or left or right):
+            return (x, y, w, h)
+        return (geo.x + left, geo.y + top,
+                geo.width - left - right, geo.height - top - bottom)
+
+    def _restore_window_state(self):
+        """Вернуть окно в развёрнутое состояние, если так его и закрыли."""
+        if getattr(self, '_was_maximized', False):
+            try:
+                self.maximize()
+            except Exception:
+                pass
+        return False
+
+    def _fit_workarea(self, w, h):
+        area = self._real_workarea()
+        if area:
+            w = min(w, area[2])
+            h = min(h, area[3])
+        return max(w, MIN_W), max(h, MIN_H)
+
+    def _load_size(self):
+        """Размер окна и было ли оно развёрнуто.
+
+        В файле два числа, как и раньше, плюс необязательное третье —
+        признак развёрнутого окна. Файл от прежней версии читается без
+        изменений: третьего значения нет, значит окно обычное.
+        """
+        self._was_maximized = False
+        try:
+            with open(self._size_file()) as f:
+                parts = f.read().split()
+            w, h = int(parts[0]), int(parts[1])
+            if len(parts) > 2:
+                self._was_maximized = parts[2] == '1'
+            return self._fit_workarea(w, h)
+        except Exception:
+            return MIN_W, MIN_H
+
+    def _on_resize(self, _w, _e):
+        try:
+            self._excl_adapt(self.get_allocated_width())
+        except Exception:
+            pass
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+        self._save_id = GLib.timeout_add(500, self._save_size)
+        return False
+
+    def _save_size(self):
+        self._save_id = None
+        try:
+            maxi = self.is_maximized()
+        except Exception:
+            maxi = False
+        try:
+            if maxi:
+                # у развёрнутого окна размер равен экрану; запиши его как
+                # обычный — и «свернуть в окно» некуда будет возвращаться,
+                # поэтому оставляем прежний размер, меняем только признак
+                w, h = getattr(self, '_normal_size', (0, 0))
+                if not w or not h:
+                    w, h = self.get_size()
+            else:
+                w, h = self.get_size()
+                self._normal_size = (w, h)
+            with open(self._size_file(), 'w') as f:
+                f.write('%d %d %d' % (w, h, 1 if maxi else 0))
+        except Exception:
+            pass
+        return False
+
+    # ── сборка всех экранов ───────────────────────────────────────────
+    def _build_all(self):
+        for ch in self.stack.get_children():
+            self.stack.remove(ch)
+        self.tiles = []
+        self.stack.add_named(self._build_main(), 'main')
+        self.stack.add_named(self._build_output(), 'output')
+        self.stack.add_named(self._build_settings(), 'settings')
+        self.stack.add_named(self._build_edit(), 'edit')
+        self.stack.add_named(self._build_exclusions(), 'exclusions')
+        self.stack.add_named(self._build_techdict(), 'techdict')
+        for _sc in self.stack.get_children():
+            self._soften(_sc)
+        self.stack.show_all()
+        self.stack.set_visible_child_name('main')
+        self.bottom_bar.hide()
+        self.about_bar.hide()
+        self.refresh_status()
+
+    def _relang(self):
+        """Пересобрать всё после смены языка, остаться на настройках."""
+        self._build_all()
+        self.stack.set_visible_child_name('settings')
+        return False
+
+    # ── шапка-строка (общая для экранов) ──────────────────────────────
+    def _topbar(self, title_text, on_back=None):
+        if on_back is None:
+            on_back = self._nav_back
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bar.get_style_context().add_class('header')
+        bar.set_border_width(14)
+        lbl = Gtk.Label()
+        lbl.set_markup('<span foreground="%s" weight="bold">%s</span>'
+                       % (CYAN, title_text))
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        # Заголовок НЕ растягиваем: иначе он занимает всю ширину и всё, что
+        # упаковано после него, уезжает к правому краю — к кнопке «Назад».
+        # Свободное место забирает распорка ниже, поэтому кнопки экрана
+        # можно ставить сразу за заголовком (см. _build_output).
+        bar.pack_start(lbl, False, False, 0)
+        self._bar_spacer = Gtk.Box()
+        bar.pack_start(self._bar_spacer, True, True, 0)
+        back = Gtk.Button()
+        back.get_style_context().add_class('mini')
+        blbl = self._lbl(self.t('back') + '  \u23ce', CYAN, bold=True)
+        back.add(blbl)
+        back.set_tooltip_text(self.t('back'))
+        self._reg_compact(blbl, self.t('back') + '  \u23ce', '\u23ce', CYAN)
+        self._hoverable(back)
+        back.connect('clicked', lambda _b: on_back())
+        bar.pack_end(back, False, False, 0)
+        self._last_back_btn = back
+        # запоминаем кнопку в самой строке: экраны ставят на неё фокус,
+        # чтобы рамка выделения не оказывалась на опасных действиях
+        bar.back_button = back
+        return bar, lbl
+
+    # ── главный экран ─────────────────────────────────────────────────
+    def _tiles_def(self):
+        return [
+            (self.t('m_start'),    '\u25b6', GREEN,  'on_start'),
+            # Остановка — обычное действие пользователя, а не авария.
+            # Красный оставлен ошибке: в индикаторе остановленная служба
+            # тоже светлая, а красный горит только при сбое.
+            (self.t('m_stop'),     '\u25a0', FG,     'on_stop'),
+            (self.t('m_restart'),  '\u21bb', YELLOW, 'on_restart'),
+            (self.t('m_autostart'),'\u23fb', BLUE,   'on_toggle_auto'),
+            (self.t('m_status'),   '\u24d8', CYAN,   'on_status'),
+            (self.t('m_log'),      '\u2630', PURPLE, 'on_log'),
+            (self.t('about'),      '\u2726', GRAY,   'on_about'),
+            (self.t('m_settings'), '\u2699', FG,     'on_settings'),
+        ]
+
+    def _build_main(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        header.get_style_context().add_class('header')
+        header.set_border_width(18)
+        title = Gtk.Label()
+        title.set_markup('<span size="21000" weight="bold" foreground="%s" '
+                         'letter_spacing="512">Autoswitch</span>' % CYAN)
+        title.set_halign(Gtk.Align.START)
+        header.pack_start(title, False, False, 0)
+        self.status_line = Gtk.Label()
+        self.status_line.set_halign(Gtk.Align.START)
+        header.pack_start(self.status_line, False, False, 0)
+        root.pack_start(header, False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_row_spacing(12); grid.set_column_spacing(12)
+        grid.set_border_width(18)
+        grid.set_row_homogeneous(True); grid.set_column_homogeneous(True)
+        grid.set_vexpand(True); grid.set_hexpand(True)
+        defs = self._apply_order('main', [(h, l, g, c) for l, g, c, h
+                                          in self._tiles_def()])
+        for i, (handler, label, glyph, color) in enumerate(defs):
+            tile = self._make_tile(label, glyph, color, getattr(self, handler))
+            self._hoverable(tile)
+            self._make_draggable(tile, handler, 'main')
+            self.tiles.append(tile)
+            grid.attach(tile, i % 2, i // 2, 1, 1)
+        self._grids['main'] = (grid, self.tiles,
+                               [h for _l, _g, _c, h in self._tiles_def()])
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(grid)
+        root.pack_start(scroll, True, True, 0)
+        return root
+
+    def _make_tile(self, label, glyph, color, handler):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class('tile')
+        btn.set_can_focus(True)
+        btn.set_size_request(-1, 70)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_valign(Gtk.Align.CENTER); box.set_halign(Gtk.Align.CENTER)
+        gl = Gtk.Label()
+        gl.set_markup('<span size="26000" foreground="%s">%s</span>'
+                      % (color, glyph))
+        lb = Gtk.Label()
+        lb.set_markup('<span size="12000" weight="bold" foreground="%s">%s'
+                      '</span>' % (color, label))
+        box.pack_start(gl, False, False, 0)
+        box.pack_start(lb, False, False, 0)
+        btn.add(box)
+        btn.connect('clicked', handler)
+        return btn
+
+    # ── экран вывода (журнал/статус) ──────────────────────────────────
+    def _build_output(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        bar, self.out_title = self._topbar('')
+        self.out_back = self._last_back_btn
+        # Кнопка очистки журнала — только на экране журнала (на статусе и
+        # отчёте она не нужна, поэтому по умолчанию скрыта). Приватность:
+        # при включённом debug_log в журнал попадают набранные слова.
+        self.btn_clearlog = Gtk.Button()
+        self.btn_clearlog.get_style_context().add_class('mini')
+        self.lbl_clearlog = self._lbl(self.t('log_clear'), PURPLE, bold=True)
+        self.btn_clearlog.add(self.lbl_clearlog)
+        # Подсказку оставляем обычным текстом: пузырёк рисует системная
+        # тема, и заданный нами цвет на светлых темах читался бы плохо.
+        self.btn_clearlog.set_tooltip_text(self.t('log_clear_tip'))
+        # рамка перескакивает на кнопку при наведении мыши, как у остальных
+        self._hoverable(self.btn_clearlog)
+        self.btn_clearlog.connect('clicked', lambda _b: self._clear_log())
+        # Ставим кнопку СЛЕВА, сразу за заголовком, а не рядом с «Назад»:
+        # иначе легко промахнуться и стереть журнал вместо выхода с экрана.
+        # reorder ставит её перед распоркой, которая забирает остальное место.
+        bar.pack_start(self.btn_clearlog, False, False, 0)
+        bar.reorder_child(self.btn_clearlog, 1)
+        # Фокус на кнопку переходит при наведении мыши (как у остальных),
+        # но ПРИ ОТКРЫТИИ журнала он ставится на «Назад» — иначе случайный
+        # Enter сразу стёр бы журнал (см. on_log).
+        # содержимое кнопки показываем сразу, скрываем/показываем только саму
+        # кнопку — иначе метка внутри остаётся невидимой и виден пустой блок
+        self.lbl_clearlog.show()
+        self.btn_clearlog.set_no_show_all(True)
+        root.pack_start(bar, False, False, 0)
+        self.out_scroll = Gtk.ScrolledWindow()
+        self.out_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                   Gtk.PolicyType.AUTOMATIC)
+        self.out_view = Gtk.TextView()
+        self.out_view.set_editable(False)
+        self.out_view.set_cursor_visible(False)
+        self.out_view.set_monospace(True)
+        self.out_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.out_view.get_style_context().add_class('output')
+        self.out_view.set_left_margin(12); self.out_view.set_right_margin(12)
+        self.out_view.set_top_margin(10)
+        # Журнал только для чтения, а GTK всё равно предлагает «Вырезать»,
+        # «Вставить», «Удалить», «Вставить Emoji» — они здесь ничего не
+        # делают и только сбивают с толку. Оставляем осмысленное:
+        # копировать, выделить всё, сохранить в файл.
+        self.out_view.connect('populate-popup', self._trim_text_menu)
+        self.out_buf = self.out_view.get_buffer()
+        self._tags = {
+            'gray':   self.out_buf.create_tag('gray',   foreground=GRAY),
+            'green':  self.out_buf.create_tag('green',  foreground=GREEN),
+            'blue':   self.out_buf.create_tag('blue',   foreground=BLUE),
+            'purple': self.out_buf.create_tag('purple', foreground=PURPLE),
+            'cyan':   self.out_buf.create_tag('cyan',   foreground=CYAN),
+        }
+        # Ширина колонки. Текст переносится по ширине окна, но не шире
+        # читаемого предела: строка в две сотни знаков читается плохо —
+        # глаз теряет начало следующей. Поэтому на широком экране текст
+        # остаётся колонкой и стоит по центру, а не жмётся к левому краю.
+        self.out_scroll.connect('size-allocate', self._fit_text_width)
+        self.out_scroll.add(self.out_view)
+        root.pack_start(self.out_scroll, True, True, 0)
+        # Перенос настроек — только на экране «О программе». Плитками, как
+        # в меню: вид один на всю программу. Импорт слева, экспорт справа —
+        # под правую руку попадает безопасное действие: случайный экспорт
+        # просто сохранит файл, а случайный импорт затёр бы настройки.
+        self.about_bar = Gtk.Grid(column_spacing=12, row_spacing=12)
+        self.about_bar.set_border_width(12)
+        self.about_bar.set_column_homogeneous(True)
+        self.about_bar.set_row_homogeneous(True)
+        aacts = [
+            ('import', self.t('imp_title'), '\u21e9', YELLOW, self.on_import),
+            ('export', self.t('exp_title'), '\u21e7', GREEN,  self.on_export),
+        ]
+        aacts = self._apply_order('about', aacts)
+        atiles = []
+        for i, (key, label, glyph, color, handler) in enumerate(aacts):
+            tile = self._make_tile(label, glyph, color,
+                                   lambda _b, h=handler: h())
+            self._hoverable(tile)
+            self._make_draggable(tile, key, 'about')
+            atiles.append(tile)
+            self.about_bar.attach(tile, i, 0, 1, 1)
+        self._grids['about'] = (self.about_bar, atiles, ['import', 'export'])
+        # Обычная высота плитки, без растяжки. На этом экране главное —
+        # описание и руководство, а перенос настроек делают раз в жизни:
+        # растянутые на треть экрана плитки перетягивали внимание на себя.
+        root.pack_start(self.about_bar, False, False, 0)
+
+        self.bottom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                  spacing=10)
+        self.bottom_bar.get_style_context().add_class('header')
+        self.bottom_bar.set_border_width(12)
+        save_all = Gtk.Button()
+        save_all.get_style_context().add_class('mini')
+        save_all.add(self._lbl(self.t('log_save'), CYAN, bold=True))
+        save_all.connect('clicked', lambda _b: self.save_all_logs())
+        self.bottom_bar.pack_start(save_all, False, False, 0)
+        hint = Gtk.Label()
+        hint.set_markup('<span foreground="%s" size="9000">%s</span>'
+                        % (GRAY, self.t('report_note')))
+        self.bottom_bar.pack_start(hint, False, False, 0)
+        root.pack_start(self.bottom_bar, False, False, 0)
+        return root
+
+    def _hover_focus(self, w, _e, idx=None):
+        """Мышь перехватывает рамку фокуса, чтобы клавиатура продолжила
+        с того места, где пользователь остановился курсором."""
+        try:
+            if w.get_sensitive() and not w.has_focus():
+                w.grab_focus()
+            if idx is not None:
+                self.focus_idx = idx
+            elif w in self.tiles:
+                self.focus_idx = self.tiles.index(w)
+        except Exception:
+            pass
+        return False
+
+    # ── перетаскивание плиток ─────────────────────────────────────────
+    def _make_draggable(self, tile, key, grid_name):
+        """Плитку можно перетащить на место другой; порядок запоминается.
+
+        Gtk.Button забирает нажатие себе и штатный drag_source_set на нём
+        не срабатывает, поэтому перетаскивание запускаем руками по порогу
+        смещения — клик при этом продолжает работать как обычно.
+        """
+        tile._key = key
+        tile._grid_name = grid_name
+        entries = [Gtk.TargetEntry.new('ASC_TILE',
+                                       Gtk.TargetFlags.SAME_APP, 0)]
+        if not hasattr(self, '_tile_tlist'):
+            self._tile_tlist = Gtk.TargetList.new(entries)
+        tile.drag_dest_set(Gtk.DestDefaults.ALL, entries, Gdk.DragAction.MOVE)
+        tile.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.BUTTON1_MOTION_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK)
+        tile.connect('drag-data-get', self._tile_drag_get)
+        tile.connect('drag-data-received', self._tile_drag_recv)
+        tile.connect('drag-begin', self._tile_drag_begin)
+        tile.connect('drag-end', self._tile_drag_end)
+        tile.connect('drag-motion', self._tile_drag_motion)
+        tile.connect('drag-leave', self._tile_drag_leave)
+        tile.connect('drag-end', self._tile_drag_end)
+        tile.connect('drag-motion', self._tile_drag_motion)
+        tile.connect('drag-leave', self._tile_drag_leave)
+        tile.connect('button-press-event', self._tile_press)
+        tile.connect('motion-notify-event', self._tile_motion)
+        tile.connect('button-release-event', self._tile_release)
+        return tile
+
+    def _drag_threshold(self):
+        """Порог, после которого нажатие считается перетаскиванием."""
+        v = getattr(self, '_dnd_thr', None)
+        if v is None:
+            try:
+                v = Gtk.Settings.get_default().get_property(
+                    'gtk-dnd-drag-threshold')
+            except Exception:
+                v = 8
+            v = int(v) if v else 8
+            self._dnd_thr = v
+        return v
+
+    def _tile_press(self, tile, ev):
+        _dbg('press кнопка=%s плитка=%s' % (ev.button, tile._key))
+        if ev.button == 3:
+            return self._tile_menu(tile, ev)
+        if ev.button == 1:
+            self._drag_from = (tile, ev.x_root, ev.y_root)
+        return False
+
+    def _tile_motion(self, tile, ev):
+        d = getattr(self, '_drag_from', None)
+        if not d:
+            _dbg('motion без нажатия')
+            return False
+        if d[0] is not tile:
+            return False
+        if not (ev.state & Gdk.ModifierType.BUTTON1_MASK):
+            _dbg('motion: кнопка отпущена, сброс')
+            self._drag_from = None
+            return False
+        # Gtk.drag_check_threshold в Python-привязках отсутствует —
+        # сравниваем сами с системным порогом перетаскивания
+        far = (abs(ev.x_root - d[1]) > self._drag_threshold()
+               or abs(ev.y_root - d[2]) > self._drag_threshold())
+        _dbg('motion сдвиг=%d,%d порог=%s'
+             % (int(ev.x_root - d[1]), int(ev.y_root - d[2]), far))
+        if far:
+            self._drag_from = None
+            try:
+                ctx = tile.drag_begin_with_coordinates(
+                    self._tile_tlist, Gdk.DragAction.MOVE, 1, ev, -1, -1)
+                _dbg('drag_begin вернул', ctx)
+            except Exception as e:
+                _dbg('drag_begin ОШИБКА:', e)
+            return True
+        return False
+
+    def _tile_release(self, _tile, _ev):
+        self._drag_from = None
+        return False
+
+    def _tile_menu(self, tile, ev):
+        if ev.button != 3:
+            return False
+        menu = Gtk.Menu()
+        item = Gtk.MenuItem(label=self.t('tiles_reset'))
+        item.connect('activate',
+                     lambda _i, n=tile._grid_name: self._reset_order(n))
+        item.show()
+        menu.append(item)
+        menu.attach_to_widget(tile, None)
+        menu.popup_at_pointer(ev)
+        return True
+
+    def _reset_order(self, grid_name):
+        grid, tiles, defaults = self._grids.get(grid_name,
+                                                (None, None, None))
+        if grid is None:
+            return
+        by_key = {t._key: t for t in tiles}
+        ordered = [by_key[k] for k in defaults if k in by_key]
+        ordered += [t for t in tiles if t._key not in defaults]
+        tiles[:] = ordered
+        self._relayout_grid(grid, tiles)
+        self._save_order(grid_name, [])
+        self._show_toast(self.t('tiles_reset_done'))
+
+    def _tile_drag_begin(self, tile, ctx):
+        """Под курсором едет сама плитка — так видно, что её оторвали."""
+        _dbg('сигнал drag-begin от', tile._key)
+        tile.get_style_context().add_class('dragging')
+        try:
+            import cairo
+            alloc = tile.get_allocation()
+            surf = tile.get_window().create_similar_surface(
+                cairo.Content.COLOR_ALPHA, alloc.width, alloc.height)
+            cr = cairo.Context(surf)
+            tile.draw(cr)
+            # курсор держит плитку за то место, где её взяли
+            surf.set_device_offset(-alloc.width / 2.0, -alloc.height / 2.0)
+            Gtk.drag_set_icon_surface(ctx, surf)
+            _dbg('снимок плитки под курсором')
+            return
+        except Exception as e:
+            _dbg('снимок не вышел:', e)
+        try:
+            Gtk.drag_set_icon_name(ctx, 'autoswitch', 32, 32)
+        except Exception:
+            pass
+
+    def _tile_drag_end(self, tile, _ctx):
+        tile.get_style_context().remove_class('dragging')
+        for name in self._grids:
+            _g, tiles, _d = self._grids[name]
+            for t in tiles:
+                t.get_style_context().remove_class('droptarget')
+
+    def _tile_drag_motion(self, tile, ctx, _x, _y, time):
+        tile.get_style_context().add_class('droptarget')
+        Gdk.drag_status(ctx, Gdk.DragAction.MOVE, time)
+        return True
+
+    def _tile_drag_leave(self, tile, _ctx, _time):
+        tile.get_style_context().remove_class('droptarget')
+
+    def _tile_drag_get(self, tile, _ctx, data, _info, _time):
+        # Кладём данные под тем же типом, который объявлен целью
+        # (ASC_TILE). set_text подменил бы тип на текстовый, цель такой
+        # не ждёт — и передача обрывалась молча, без ошибки.
+        _dbg('drag-data-get от', tile._key)
+        try:
+            data.set(data.get_target(), 8, tile._key.encode('utf-8'))
+        except Exception as e:
+            _dbg('set данных ОШИБКА:', e)
+
+    def _tile_drag_recv(self, target, _ctx, _x, _y, data, _info, _time):
+        raw = None
+        try:
+            raw = data.get_data()
+        except Exception as e:
+            _dbg('get данных ОШИБКА:', e)
+        src_key = raw.decode('utf-8', 'replace') if raw else None
+        _dbg('drag-data-received: на %s пришло %r' % (target._key, src_key))
+        if not src_key or src_key == target._key:
+            return
+        grid_name = target._grid_name
+        grid, tiles, _def = self._grids.get(grid_name,
+                                            (None, None, None))
+        if grid is None:
+            return
+        keys = [t._key for t in tiles]
+        if src_key not in keys or target._key not in keys:
+            return
+        # Меняем плитки местами. Раньше исходную вырезали и вставляли
+        # перед целью — но после вырезания индекс цели съезжал, и при
+        # перетаскивании слева направо плитка возвращалась на своё же
+        # место. Обмен симметричен и работает в любую сторону.
+        i_src = keys.index(src_key)
+        i_dst = keys.index(target._key)
+        tiles[i_src], tiles[i_dst] = tiles[i_dst], tiles[i_src]
+        src = tiles[i_dst]
+        self._relayout_grid(grid, tiles)
+        self._save_order(grid_name, [t._key for t in tiles])
+        if grid_name == 'main':
+            self.tiles = tiles
+            self.focus_idx = tiles.index(src)
+        GLib.idle_add(src.grab_focus)
+
+    def _relayout_grid(self, grid, tiles):
+        for t in tiles:
+            grid.remove(t)
+        for i, t in enumerate(tiles):
+            grid.attach(t, i % 2, i // 2, 1, 1)
+        grid.show_all()
+
+    def _row_target(self, row):
+        return (getattr(row, '_chk', None) or getattr(row, '_btn', None)
+                or row)
+
+    def _focus_row(self, row):
+        try:
+            self._row_target(row).grab_focus()
+        except Exception:
+            pass
+        return False
+
+    def _focus_first(self, listbox):
+        rows = [r for r in listbox.get_children() if r.get_visible()]
+        if rows:
+            self._focus_row(rows[0])
+        return False
+
+    def _focused_row(self):
+        w = self.get_focus()
+        while w is not None and not isinstance(w, Gtk.ListBoxRow):
+            w = w.get_parent()
+        return w
+
+    def _list_nav(self, key, d):
+        """W/S — по строкам, A/D — между колонками, как в главном меню."""
+        row = self._focused_row()
+        if row is None:
+            self._focus_first(self.ex_listbox)
+            return True
+        lb = row.get_parent()
+        rows = [r for r in lb.get_children() if r.get_visible()]
+        if row not in rows:
+            return False
+        idx = rows.index(row)
+        if d == 'up' or key == Gdk.KEY_Up:
+            self._focus_row(rows[max(0, idx - 1)])
+            return True
+        if d == 'down' or key == Gdk.KEY_Down:
+            self._focus_row(rows[min(len(rows) - 1, idx + 1)])
+            return True
+        if d in ('left', 'right') or key in (Gdk.KEY_Left, Gdk.KEY_Right):
+            other = (self.ex_added_box if lb is self.ex_listbox
+                     else self.ex_listbox)
+            self._focus_first(other)
+            return True
+        return False
+
+    def _activate_focused(self):
+        """Enter работает как пробел: отмечает галочку или жмёт кнопку."""
+        w = self.get_focus()
+        if isinstance(w, Gtk.ListBoxRow):
+            w = self._row_target(w)
+        if isinstance(w, Gtk.CheckButton):
+            w.set_active(not w.get_active())
+            return True
+        if isinstance(w, Gtk.Button):
+            w.clicked()
+            return True
+        return False
+
+    def _click_focus(self, _w, _e, target):
+        try:
+            if target.get_sensitive() and not target.has_focus():
+                target.grab_focus()
+        except Exception:
+            pass
+        return False
+
+    def _clickable(self, row, target):
+        row.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        row.connect('button-press-event', self._click_focus, target)
+        return row
+
+    def _hoverable(self, w, idx=None):
+        w.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK)
+        w.connect('enter-notify-event', self._hover_focus, idx)
+        return w
+
+    def _reg_compact(self, lbl, full, short, color):
+        self._compact.append((lbl, full, short, color))
+
+    def _apply_compact(self, narrow):
+        if narrow == self._is_compact:
+            return
+        self._is_compact = narrow
+        for lbl, full, short, color in self._compact:
+            lbl.set_markup('<span foreground="%s" weight="bold">%s</span>'
+                           % (color, short if narrow else full))
+
+    def _soften(self, w):
+        """Длинные подписи сжимаются вместо того, чтобы держать ширину окна.
+        Кнопки топбара (.mini) и выпадающие списки не трогаем."""
+        try:
+            if isinstance(w, Gtk.ComboBox):
+                return
+            if isinstance(w, Gtk.Button) and \
+                    w.get_style_context().has_class('mini'):
+                return
+            if isinstance(w, Gtk.Label):
+                if not w.get_line_wrap():
+                    w.set_ellipsize(Pango.EllipsizeMode.END)
+                return
+            if isinstance(w, Gtk.Container):
+                for ch in w.get_children():
+                    self._soften(ch)
+        except Exception:
+            pass
+
+    def _ellipsize_check(self, chk):
+        """Длинные подписи обрезаем — иначе окно нельзя сузить."""
+        try:
+            lb = chk.get_child()
+            if isinstance(lb, Gtk.Label):
+                lb.set_ellipsize(Pango.EllipsizeMode.END)
+                lb.set_halign(Gtk.Align.START)
+        except Exception:
+            pass
+
+    def _lbl(self, text, color, bold=False):
+        lb = Gtk.Label()
+        w = ' weight="bold"' if bold else ''
+        lb.set_markup('<span foreground="%s"%s>%s</span>' % (color, w, text))
+        return lb
+
+    # ── экран настроек (в том же окне) ────────────────────────────────
+    def _build_settings(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class('settings-screen')
+        bar, _ = self._topbar(self.t('set_title'))
+        root.pack_start(bar, False, False, 0)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        inner.set_border_width(20)
+        inner.get_style_context().add_class('settings-body')
+
+        # Индикатор
+        r1 = Gtk.Box(spacing=10)
+        r1.pack_start(self._lbl(self.t('set_indicator') + ':', CYAN),
+                      False, False, 0)
+        sw = Gtk.Switch()
+        sw.set_active(cfg_get('show_indicator', 'on') == 'on')
+        sw.connect('notify::active',
+                   lambda s, _p: cfg_set('show_indicator',
+                                         'on' if s.get_active() else 'off'))
+        r1.pack_end(sw, False, False, 0)
+        inner.pack_start(r1, False, False, 0)
+
+        inner.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                         False, False, 6)
+
+        # Действия — плитками 2x2, как в главном меню (растягиваются)
+        sgrid = Gtk.Grid()
+        sgrid.set_row_spacing(12); sgrid.set_column_spacing(12)
+        sgrid.set_row_homogeneous(True); sgrid.set_column_homogeneous(True)
+        sgrid.set_vexpand(True); sgrid.set_hexpand(True)
+        acts = [
+            ('config', self.t('set_config'), '\u270e', YELLOW,
+             self._edit_config),
+            ('excl',   self.t('set_excl'),   '\u2298', CYAN,
+             self._show_exclusions),
+            ('lang',   self.t('set_lang'),   '\u21c6', PURPLE,
+             self._toggle_lang),
+            ('techdict', self.t('m_techdict'), '\u2261', GREEN,
+             self._show_techdict),
+        ]
+        acts = self._apply_order('settings', acts)
+        stiles = []
+        for i, (key, label, glyph, color, handler) in enumerate(acts):
+            tile = self._make_tile(label, glyph, color,
+                                   lambda _b, h=handler: h())
+            self._hoverable(tile)
+            self._make_draggable(tile, key, 'settings')
+            stiles.append(tile)
+            sgrid.attach(tile, i % 2, i // 2, 1, 1)
+        self._grids['settings'] = (sgrid, stiles,
+                                   ['config', 'excl', 'lang', 'techdict'])
+        inner.pack_start(sgrid, True, True, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(inner)
+        root.pack_start(scroll, True, True, 0)
+        return root
+
+    def _settings_btn(self, label, color, handler):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class('setrow')
+        btn.add(self._lbl(label, color, bold=True))
+        btn.connect('clicked', handler)
+        return btn
+
+    # ── CSS ───────────────────────────────────────────────────────────
+    def _apply_css(self):
+        try:
+            Gtk.Settings.get_default().set_property(
+                'gtk-application-prefer-dark-theme', True)
+        except Exception:
+            pass
+        css = Gtk.CssProvider()
+        css.load_from_data((("""
+            window { background: %(bg)s; color: %(fg)s; }
+            /* диалоги (исключения, тех-словарь) — тот же тёмный фон;
+               на GNOME без этого они брали светлую системную тему */
+            dialog, dialog.background, dialog box, dialog .dialog-vbox,
+            messagedialog, messagedialog.background {
+                background: %(bg)s; color: %(fg)s; }
+            dialog .titlebar, dialog headerbar {
+                background: %(panel)s; color: %(fg)s;
+                border-bottom: 1px solid %(border)s; }
+            /* заголовок диалога — светлый текст, чтобы был виден */
+            dialog .titlebar label, dialog headerbar label,
+            dialog .titlebar .title, dialog headerbar .title {
+                color: %(fg)s; font-weight: bold; }
+            /* Все кнопки внутри диалога (низ + "добавить окно") — тёмные.
+               messagedialog обязателен наравне с dialog: у GTK это
+               отдельный узел, и без него кнопки окон-вопросов оставались
+               светлыми из системной темы, а надписи на них — светлыми от
+               правила выше. Светлое по светлому: кнопок почти не видно. */
+            dialog button, dialog .dialog-action-area button,
+            dialog buttonbox button, dialog headerbar button,
+            messagedialog button, messagedialog .dialog-action-area button,
+            messagedialog buttonbox button, messagedialog headerbar button {
+                background: %(stile)s; color: %(fg)s;
+                border: 1px solid %(sborder)s; border-radius: 6px;
+                padding: 6px 14px; }
+            dialog button:hover,
+            dialog .dialog-action-area button:hover,
+            messagedialog button:hover,
+            messagedialog .dialog-action-area button:hover {
+                background: %(shover)s; border-color: %(cyan)s; }
+            dialog button:disabled,
+            dialog .dialog-action-area button:disabled,
+            messagedialog button:disabled,
+            messagedialog .dialog-action-area button:disabled {
+                background: %(bg)s; color: %(border)s; }
+            scrolledwindow, scrolledwindow viewport {
+                background: %(sbg)s; }
+            .header { background: %(panel)s; border-bottom: 1px solid %(border)s; }
+            .output { background: %(bg)s; color: %(fg)s; font-family: monospace; }
+            textview, textview text { background: %(bg)s; color: %(fg)s;
+                caret-color: %(cyan)s; }
+            textview text selection, textview selection,
+            entry selection, label selection {
+                background: %(msel)s; color: #ffffff; }
+            button.tile { background: %(tile)s; border: 1px solid %(border)s;
+                border-radius: 10px;
+                transition: background 120ms ease, border-color 120ms ease; }
+            button.tile:hover { background: %(hover)s; border-color: %(cyan)s; }
+            /* плитка, которую тащат: гаснет на месте, видно что её взяли */
+            button.tile.dragging { opacity: 0.35; border-style: dashed; }
+            /* плитка, на которую наведён перенос: цель обмена */
+            button.tile.droptarget {
+                background: %(hover)s; border-color: %(green)s;
+                box-shadow: inset 0 0 0 3px %(green)s; }
+            button.tile:focus { background: %(hover)s; border-color: %(cyan)s;
+                box-shadow: inset 0 0 0 2px %(cyan)s; outline: none; }
+            button.tile:focus:hover { background: %(hover)s;
+                border-color: %(cyan)s; }
+            button.tile:active { background: #0a1010; }
+            button.mini { background: %(tile)s; border: 1px solid %(border)s;
+                border-radius: 6px; padding: 3px 12px; }
+            button.mini:hover { background: %(hover)s; }
+            button.mini:focus { background: %(hover)s; border-color: %(cyan)s;
+                box-shadow: inset 0 0 0 2px %(cyan)s; outline: none; }
+            label { color: %(fg)s; }
+            separator { background: %(border)s; min-height: 1px; }
+            /* разделитель двух колонок в исключениях */
+            paned > separator {
+                background: %(sborder)s; min-width: 4px; min-height: 4px; }
+            paned > separator:hover { background: %(cyan)s; }
+            /* экран настроек — осветлённый, чтобы не сливался */
+            .settings-screen { background: %(sbg)s; }
+            .settings-body { background: %(sbg)s; }
+            button.setrow { background: %(stile)s; border: 1px solid %(sborder)s;
+                border-radius: 8px; padding: 10px; }
+            button.setrow:hover { background: %(shover)s; border-color: %(cyan)s; }
+            button.setrow:focus { background: %(shover)s; border-color: %(cyan)s;
+                box-shadow: inset 0 0 0 2px %(cyan)s; outline: none; }
+            /* фокус на строках списков и переключателях */
+            row:focus, listbox row:focus-within {
+                box-shadow: inset 0 0 0 2px %(cyan)s; }
+            checkbutton:focus check { border-color: %(cyan)s; }
+            checkbutton:focus {
+                box-shadow: inset 0 0 0 2px %(cyan)s; border-radius: 6px;
+                outline: none; }
+            .steamrow:focus {
+                background: %(shover)s; border-color: %(cyan)s;
+                box-shadow: inset 0 0 0 2px %(cyan)s; }
+            entry:focus { border-color: %(cyan)s;
+                box-shadow: inset 0 0 0 1px %(cyan)s; }
+            switch:focus { border-color: %(cyan)s; }
+            /* заголовок окна — тёмный, светлый текст */
+            headerbar, headerbar.titlebar, .titlebar {
+                background: %(panel)s; color: %(fg)s;
+                border-bottom: 1px solid %(border)s;
+                min-height: 32px; padding: 0 6px; }
+            headerbar .title, headerbar label, .titlebar label {
+                color: %(fg)s; font-weight: bold; }
+            /* Кнопки окна (свернуть/развернуть/закрыть) рисуются значком
+               из темы. Задавать им свой фон нельзя: на Breeze (KDE) значок
+               берётся из темы иконок GTK, которой там может не быть, и
+               остаются пустые квадраты. Красим только сам значок. */
+            headerbar button.titlebutton, .titlebar button.titlebutton {
+                color: %(fg)s; background: none; border: none;
+                box-shadow: none; }
+            headerbar button.titlebutton:hover,
+            .titlebar button.titlebutton:hover {
+                background: %(hover)s; border-radius: 6px; }
+            /* тёмные выпадающие списки и переключатели */
+            combobox, combobox * { color: %(fg)s; }
+            combobox box { background: %(stile)s; border: 1px solid %(sborder)s;
+                border-radius: 6px; }
+            combobox window, combobox window.background,
+            combobox window menu, menu, popover, popover.background {
+                background: %(panel)s; color: %(fg)s;
+                border: 1px solid %(border)s; }
+            menuitem, combobox window menuitem { color: %(fg)s; padding: 4px 10px; }
+            menuitem:hover, combobox window menuitem:selected {
+                background: %(msel)s; color: #ffffff; }
+            menuitem:hover label, menuitem:selected label,
+            combobox window menuitem:selected label {
+                color: #ffffff; }
+            menu label, popover label { color: %(fg)s; }
+            switch { background: %(stile)s; border: 1px solid %(sborder)s;
+                min-width: 44px; min-height: 24px; }
+            switch:checked { background: #1f6b6b; }
+            switch slider { background: #cfe9e9; border-radius: 50%%;
+                min-width: 20px; min-height: 20px; }
+            switch:checked slider { background: %(cyan)s; }
+            entry { background: %(stile)s; color: %(fg)s;
+                border: 1px solid %(sborder)s; border-radius: 6px;
+                caret-color: %(cyan)s; }
+            checkbutton { color: %(fg)s; }
+            checkbutton check {
+                background: %(bg)s; border: 2px solid %(sborder)s;
+                border-radius: 4px; min-width: 16px; min-height: 16px;
+                margin-right: 4px; }
+            checkbutton:hover check { border-color: %(cyan)s; }
+            checkbutton check:checked {
+                background: %(cyan)s; border-color: %(cyan)s; color: #000; }
+            /* строка Steam — выделена рамкой, чтобы не терялась */
+            .steamrow {
+                background: %(stile)s; border: 1px solid %(sborder)s;
+                border-radius: 8px; padding: 8px 10px; }
+            list, listbox, row { background: %(sbg)s; color: %(fg)s; }
+            row:selected { background: %(shover)s; }
+            /* выпадающие списки — тёмные во всех местах */
+            window.popup, window.background.popup,
+            .combo, combobox window, combobox window * ,
+            treeview, treeview.view, .menu, menu, popover, popover.background,
+            cellview {
+                background: %(panel)s; color: %(fg)s; }
+            treeview.view:selected, menuitem:hover, menuitem:selected,
+            combobox window menuitem:selected {
+                background: %(msel)s; color: #ffffff; }
+            menuitem { color: %(fg)s; padding: 4px 10px; }
+            .toast { background: %(cyan)s; border-radius: 8px;
+                padding: 8px 18px; margin: 6px; }
+        """) % dict(bg=BG, fg=FG, panel=PANEL, tile=TILE, border=BORDER,
+                    hover=HOVER, cyan=CYAN, focus=FOCUS,
+                    sbg='#0f1519', stile='#16202a', sborder='#2a4a5a',
+                    shover='#1b2833', msel='#1f5f6b',
+                    green=GREEN)).encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ── навигация клавиатурой (WASD + стрелки) ────────────────────────
+    def _focus_tile(self, idx):
+        if 0 <= idx < len(self.tiles):
+            self.focus_idx = idx
+            self.tiles[idx].grab_focus()
+        return False
+
+    def _in_text_widget(self):
+        """В поле ввода буквы должны печататься, а не двигать фокус."""
+        w = self.get_focus()
+        return isinstance(w, (Gtk.Entry, Gtk.TextView, Gtk.SearchEntry))
+
+    def _wasd_dir(self, event):
+        """WASD в направление. Работает и в русской раскладке (цфыв)."""
+        ch = event.string.lower() if event.string else ''
+        name = (Gdk.keyval_name(event.keyval) or '').lower()
+        for src in (ch, name):
+            if src in ('w', '\u0446'):
+                return 'up'
+            if src in ('s', '\u044b'):
+                return 'down'
+            if src in ('a', '\u0444'):
+                return 'left'
+            if src in ('d', '\u0432'):
+                return 'right'
+        return None
+
+    def _on_key(self, _w, event):
+        cur = self.stack.get_visible_child_name()
+        key = event.keyval
+
+        if key == Gdk.KEY_Escape:
+            if cur != 'main':
+                self._nav_back()
+                return True
+            return False
+
+        in_text = self._in_text_widget()
+        d = None if in_text else self._wasd_dir(event)
+
+        if cur == 'main':
+            return self._nav_tiles(event, key, d)
+
+        # Enter — как пробел: жмёт кнопку или отмечает галочку под рамкой
+        if not in_text and key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if self._activate_focused():
+                return True
+        # если рамка стоит на строке целиком, пробел GTK не доносит до галочки
+        if not in_text and key in (Gdk.KEY_space, Gdk.KEY_KP_Space) \
+                and isinstance(self.get_focus(), Gtk.ListBoxRow):
+            if self._activate_focused():
+                return True
+
+        arrow = {Gdk.KEY_Up: 'up', Gdk.KEY_Down: 'down',
+                 Gdk.KEY_Left: 'left', Gdk.KEY_Right: 'right'}.get(key)
+        w = self.get_focus()
+        if isinstance(w, Gtk.TextView):
+            # в редакторе стрелки двигают курсор по тексту
+            arrow = None
+        elif isinstance(w, Gtk.Entry) and arrow in ('left', 'right'):
+            # в поле ввода влево/вправо — каретке, вверх/вниз — навигации
+            arrow = None
+
+        move = d or arrow
+        if move is None:
+            return False
+        dirs = {
+            'up': Gtk.DirectionType.UP,
+            'down': Gtk.DirectionType.DOWN,
+            'left': Gtk.DirectionType.LEFT,
+            'right': Gtk.DirectionType.RIGHT,
+        }
+        before = self.get_focus()
+        self.child_focus(dirs[move])
+        if self.get_focus() is before:
+            # список удерживает фокус на крайней строке — выходим табом
+            self.child_focus(Gtk.DirectionType.TAB_BACKWARD
+                             if move in ('up', 'left')
+                             else Gtk.DirectionType.TAB_FORWARD)
+        return True
+
+    def _nav_tiles(self, event, key, d):
+        cols = 2
+        rows = (len(self.tiles) + 1) // cols
+        i = self.focus_idx
+        r, c = i // cols, i % cols
+        if key == Gdk.KEY_Right or d == 'right':
+            c = min(c + 1, cols - 1)
+        elif key == Gdk.KEY_Left or d == 'left':
+            c = max(c - 1, 0)
+        elif key == Gdk.KEY_Down or d == 'down':
+            r = min(r + 1, rows - 1)
+        elif key == Gdk.KEY_Up or d == 'up':
+            r = max(r - 1, 0)
+        elif key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            if 0 <= i < len(self.tiles):
+                self.tiles[i].clicked()
+            return True
+        else:
+            return False
+        new = r * cols + c
+        if new >= len(self.tiles):
+            new = len(self.tiles) - 1
+        self._focus_tile(new)
+        return True
+
+    def _nav_to(self, name):
+        """Перейти на экран, запомнив текущий в истории (уровень вниз)."""
+        cur = self.stack.get_visible_child_name()
+        if cur != name:
+            self._nav.append(cur)
+        self.stack.set_visible_child_name(name)
+
+    def _nav_back(self):
+        """Вернуться на уровень назад (Назад/Esc), как в asc."""
+        self._excl_cancel_catch()
+        if len(self._nav) > 1:
+            prev = self._nav.pop()
+        else:
+            prev = 'main'
+        self.stack.set_visible_child_name(prev)
+        if prev == 'main':
+            self._focus_tile(self.focus_idx)
+
+    def _go_main(self):
+        self._nav = ['main']
+        self.stack.set_visible_child_name('main')
+        self._focus_tile(self.focus_idx)
+
+    # ── вывод ─────────────────────────────────────────────────────────
+    def show_output(self, text, title, colorize=False, about=False,
+                    to_end=False, with_clear=False):
+        self._about_mode = about
+        # кнопка очистки — только на экране журнала
+        if hasattr(self, 'btn_clearlog'):
+            if with_clear:
+                self.btn_clearlog.show()
+            else:
+                self.btn_clearlog.hide()
+        if about:
+            self.out_scroll.set_vexpand(True)
+            self.bottom_bar.show()
+            self.about_bar.show_all()
+        else:
+            self.out_scroll.set_vexpand(True)
+            self.bottom_bar.hide()
+            self.about_bar.hide()
+        self.out_title.set_markup(
+            '<span foreground="%s" weight="bold">%s</span>' % (CYAN, title))
+        self.out_buf.set_text('')
+        if colorize:
+            self._insert_colored(text)
+        else:
+            self.out_buf.set_text(text)
+        self._nav_to('output')
+        # фокус — на «Назад»: и видно, где он, и случайный Enter просто
+        # вернёт в меню, а не сотрёт журнал
+        if hasattr(self, 'out_back'):
+            GLib.idle_add(self.out_back.grab_focus)
+        # журнал — сразу к концу, чтобы видеть последние записи
+        if to_end:
+            GLib.idle_add(self._scroll_end)
+
+    # предел ширины колонки в знаках — дальше растут поля, а не строка
+    TEXT_MAX_CHARS = 96
+
+    def _fit_text_width(self, widget, alloc):
+        """Держать текст колонкой по центру, когда окно шире предела."""
+        try:
+            ctx = self.out_view.get_pango_context()
+            metrics = ctx.get_metrics(ctx.get_font_description(), None)
+            ch = metrics.get_approximate_char_width() / Pango.SCALE
+            if ch <= 0:
+                return
+            want = int(ch * self.TEXT_MAX_CHARS)
+            extra = alloc.width - want
+            margin = max(12, extra // 2) if extra > 24 else 12
+            if self.out_view.get_left_margin() != margin:
+                self.out_view.set_left_margin(margin)
+                self.out_view.set_right_margin(margin)
+        except Exception:
+            pass
+
+    def _trim_text_menu(self, _view, menu):
+        """Своё контекстное меню для журнала.
+
+        Стандартное меню GTK предлагает «Вырезать», «Вставить», «Удалить»,
+        «Вставить Emoji» — в журнале, открытом только на чтение, они ничего
+        не делают, а «Сохранить содержимое в файл» дублирует наш пункт.
+        Фильтровать чужие пункты по названию нельзя: имена зависят от языка
+        системы. Поэтому убираем ВСЁ и собираем меню сами — одинаково на
+        любой системе и на языке, выбранном в программе.
+        """
+        try:
+            for item in list(menu.get_children()):
+                menu.remove(item)
+            def add(label, cb):
+                mi = Gtk.MenuItem(label=label)
+                mi.connect('activate', lambda _m: cb())
+                menu.append(mi)
+
+            add(self.t('ctx_copy'), self._ctx_copy)
+            add(self.t('ctx_select_all'), self._ctx_select_all)
+            # Пункт сохранения ровно один, и он меняется по обстановке:
+            # выделен кусок — предлагаем сохранить его, нет выделения —
+            # весь журнал. Показывать оба (один серым) нельзя: неактивный
+            # пункт выглядит как поломка, хотя всё работает.
+            menu.append(Gtk.SeparatorMenuItem())
+            if self.out_buf.get_has_selection():
+                add(self.t('ctx_save_sel'), self._ctx_save_selection)
+            else:
+                add(self.t('ctx_save'), self._save_buffer)
+            menu.show_all()
+        except Exception:
+            pass
+
+    def _ctx_save_selection(self):
+        """Сохранить в файл только выделенный фрагмент журнала."""
+        try:
+            bounds = self.out_buf.get_selection_bounds()
+            if not bounds:
+                return
+            s, e = bounds
+            text = self.out_buf.get_text(s, e, True)
+            if self._about_mode:
+                text = self._wrap_manual(text)
+            self._file_save(self._out_fname(fragment=True), text)
+        except Exception:
+            pass
+
+    def _ctx_copy(self):
+        """Скопировать выделенное (или всё, если ничего не выделено)."""
+        try:
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            if self.out_buf.get_has_selection():
+                self.out_buf.copy_clipboard(cb)
+            else:
+                s, e = self.out_buf.get_bounds()
+                cb.set_text(self.out_buf.get_text(s, e, True), -1)
+            self._show_toast(self.t('ctx_copied'))
+        except Exception:
+            pass
+
+    def _ctx_select_all(self):
+        try:
+            s, e = self.out_buf.get_bounds()
+            self.out_buf.select_range(s, e)
+        except Exception:
+            pass
+
+    def _scroll_end(self):
+        try:
+            self.out_view.scroll_to_iter(
+                self.out_buf.get_end_iter(), 0.0, False, 0, 0)
+            adj = self.out_scroll.get_vadjustment()
+            adj.set_value(adj.get_upper())
+        except Exception:
+            pass
+        return False
+
+    def _insert_colored(self, text):
+        rx = re.compile(r'^(\S+\s+\d+\s+[\d:]+\s+\S+\s+)(\S+):\s(.*)$')
+        rx_stat = re.compile(r'^(\s*[A-Z][A-Za-z ]+:\s)(.*)$')
+        for line in text.splitlines():
+            m = rx.match(line)
+            if m:
+                when, src, body = m.group(1), m.group(2), m.group(3)
+                c = ('blue' if src.startswith('systemd') else
+                     'purple' if src.startswith('kernel') else
+                     'green' if src.startswith('env') else 'cyan')
+                self._app(when, 'gray'); self._app(src, c)
+                self._app(': ' + body + '\n', None)
+                continue
+            m = rx_stat.match(line)
+            if m:
+                fld, val = m.group(1), m.group(2)
+                self._app(fld, 'gray')
+                self._app(val + '\n',
+                          'green' if val.lower().startswith('active (running)')
+                          else None)
+                continue
+            self._app(line + '\n', None)
+
+    def _app(self, text, tag):
+        end = self.out_buf.get_end_iter()
+        if tag:
+            self.out_buf.insert_with_tags(end, text, self._tags[tag])
+        else:
+            self.out_buf.insert(end, text)
+
+    def _out_fname(self, fragment=False):
+        """Имя файла под то, что сейчас на экране.
+
+        Поведение одно и то же, а содержимое разное: в «О программе» это
+        руководство, в остальных случаях — журнал. Значит и расширение
+        разное: руководство это текст, а не лог.
+        """
+        now = datetime.datetime.now()
+        if self._about_mode:
+            return 'autoswitch-manual-%s%s.txt' % (
+                now.strftime('%Y%m%d'), '-fragment' if fragment else '')
+        if fragment:
+            return 'autoswitch-%s-%s-fragment.log' % (
+                now.strftime('%Y%m%d'), now.strftime('%H%M'))
+        return None   # длину посчитает вызывающий: она нужна в имени
+
+    def _save_buffer(self):
+        s, e = self.out_buf.get_bounds()
+        content = self.out_buf.get_text(s, e, True)
+        fname = self._out_fname()
+        if fname is None:
+            now = datetime.datetime.now()
+            fname = 'autoswitch-%s-%s-%d.log' % (
+                now.strftime('%Y%m%d'), now.strftime('%H%M'),
+                len(content.splitlines()))
+        if self._about_mode:
+            content = self._wrap_manual(content)
+        self._file_save(fname, content)
+
+    @staticmethod
+    def _wrap_manual(text):
+        """Свёрстать руководство для файла.
+
+        На экране строки переносит GTK по ширине окна, поэтому в тексте
+        абзац — одна длинная строка. В файле так нельзя: обычный редактор
+        без переноса по словам заставит мотать вбок.
+        """
+        import textwrap
+        out = []
+        for line in text.split('\n'):
+            st = line.strip()
+            if not st or st.startswith('\u2500') or line.startswith('    ') \
+                    or st.isupper():
+                out.append(line.rstrip())
+            else:
+                out.extend(textwrap.wrap(st, 90))
+        return '\n'.join(out) + '\n'
+
+    def _file_save(self, fname, content):
+        dlg = Gtk.FileChooserDialog(title=self.t('log_save'), parent=self,
+                                    action=Gtk.FileChooserAction.SAVE)
+        dlg.add_buttons(self.t('cancel'), Gtk.ResponseType.CANCEL,
+                        self.t('log_save'), Gtk.ResponseType.OK)
+        dlg.set_current_name(fname)
+        saved = None
+        if dlg.run() == Gtk.ResponseType.OK:
+            try:
+                saved = dlg.get_filename()
+                with open(saved, 'w') as f:
+                    f.write(content)
+            except Exception:
+                saved = None
+        dlg.destroy()
+        return saved
+
+    def refresh_status(self):
+        active, enabled = svc_active(), svc_enabled()
+        # «остановлен» — не авария, а обычное состояние: как и в
+        # индикаторе, показываем его нейтральным, красный бережём
+        # для настоящих ошибок
+        st_c, st_t = ((GREEN, self.t('running')) if active
+                      else (GRAY, self.t('stopped')))
+        au_c, au_t = ((GREEN, self.t('on')) if enabled
+                      else (YELLOW, self.t('off')))
+        self.status_line.set_markup(
+            '%s: <span foreground="%s" weight="bold">%s</span>'
+            '      %s: <span foreground="%s" weight="bold">%s</span>'
+            % (self.t('state'), st_c, st_t, self.t('autostart'),
+               au_c, au_t))
+
+    def _tick(self):
+        self.refresh_status()
+        return True
+
+    # ── обработчики плиток ────────────────────────────────────────────
+    def _svc(self, action, title, done=None):
+        """Действие над службой.
+
+        При успехе показываем всплывающее сообщение и остаёмся в меню:
+        отдельный экран с одним словом «ok» и кнопкой «Назад» — лишний
+        шаг. Экран вывода открываем только при ошибке, там есть что
+        прочитать.
+        """
+        rc, out = svc_action(action)
+        if rc != 0 and ('dismiss' in out.lower()
+                        or 'not authorized' in out.lower()):
+            return  # отмена пароля — просто ничего
+        self.refresh_status()
+        if rc == 0:
+            self._show_toast(done or title, ms=2000)
+            return
+        self.show_output(out or 'ok', title)
+
+    def on_start(self, _b):
+        self._svc('start', self.t('m_start'), self.t('done_start'))
+
+    def on_stop(self, _b):
+        self._svc('stop', self.t('m_stop'), self.t('done_stop'))
+
+    def on_restart(self, _b):
+        self._svc('restart', self.t('m_restart'), self.t('done_restart'))
+
+    def on_toggle_auto(self, _b):
+        action = 'disable' if svc_enabled() else 'enable'
+        title = (self.t('as_on_done') if action == 'enable'
+                 else self.t('as_off_done'))
+        self._svc(action, title)
+
+    def on_status(self, _b):
+        self.show_output(svc_status_text(), self.t('m_status'), colorize=True)
+
+    def on_log(self, _b):
+        # журнал сразу к концу — последние записи внизу видны первыми
+        self.show_output(svc_log_today(), self.t('m_log'), colorize=True,
+                         to_end=True, with_clear=True)
+
+    def _confirm(self, title, question):
+        """Диалог «да/нет» для необратимых действий."""
+        dlg = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL, text=title)
+        dlg.format_secondary_text(question)
+        resp = dlg.run()
+        dlg.destroy()
+        return resp == Gtk.ResponseType.OK
+
+    def _clear_log(self):
+        """Стереть журнал (после подтверждения).
+
+        journald не умеет удалять записи выборочно по одной службе, поэтому
+        чистится весь системный журнал — об этом честно предупреждаем.
+        Нужно для приватности: при включённом debug_log в журнал попадают
+        набранные слова.
+        """
+        if not self._confirm(self.t('log_clear_t'), self.t('log_clear_q')):
+            return
+        rc, _out = run(['pkexec', HELPER, 'clear-log'])
+        if rc == 0:
+            self.show_output(svc_log_today(), self.t('m_log'), colorize=True,
+                             to_end=True, with_clear=True)
+            self._show_toast(self.t('log_cleared'))
+        else:
+            self._show_toast(self.t('log_clear_fail'))
+
+    def on_settings(self, _b):
+        self._nav_to('settings')
+
+    def on_about(self, _b):
+        if self.lang == 'ru':
+            text = ('Autoswitch — автоматическое переключение раскладки '
+                    'клавиатуры.\n\nВерсия:  %s\nАвтор:   Shah-man\n'
+                    'Проект:  %s\n\nОпределяет язык набираемого слова и '
+                    'переключает раскладку,\nработает на X11 и Wayland, '
+                    'показывает индикатор в трее.' % (VERSION, REPO))
+        else:
+            text = ('Autoswitch — automatic keyboard layout switcher.\n\n'
+                    'Version:  %s\nAuthor:   Shah-man\nProject:  %s\n\n'
+                    'Detects the language of the typed word and switches '
+                    'the layout,\nworks on X11 and Wayland, shows a tray '
+                    'indicator.' % (VERSION, REPO))
+        text += '\n\n\n' + (MANUAL_RU if self.lang == 'ru' else MANUAL_EN)
+        self.show_output(text, self.t('about'), about=True)
+
+    # ── перенос настроек: экспорт и импорт ────────────────────────────
+    # Формат нарочно текстовый, а не архив: человек может открыть файл
+    # блокнотом, посмотреть, что увозит, и при нужде поправить руками.
+    EXPORT_MARK = '# autoswitch settings export'
+
+    def _export_text(self):
+        """Собрать файл переноса: настройки + «Мой словарь»."""
+        try:
+            with open(CONFIG, encoding='utf-8', errors='replace') as f:
+                conf = f.read()
+        except OSError:
+            conf = ''
+        try:
+            with open(LEARNED, encoding='utf-8', errors='replace') as f:
+                learned = f.read()
+        except OSError:
+            learned = ''
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+        head = (self.EXPORT_MARK + '\n'
+                '# version=1  date=%s\n'
+                '# %s\n'
+                '# %s\n\n' % (now, self.t('exp_hint'), self.t('imp_hint')))
+        return head + '[config]\n' + conf.rstrip('\n') + \
+            '\n\n[learned]\n' + learned.rstrip('\n') + '\n'
+
+    @staticmethod
+    def _parse_export(text):
+        """Разобрать файл переноса на две части.
+
+        Возвращает (конфиг, строки словаря) или (None, None), если это
+        не наш файл — тогда ничего не трогаем.
+        """
+        if not text.lstrip().startswith('# autoswitch settings export'):
+            return None, None
+        conf, learned, where = [], [], None
+        for line in text.splitlines():
+            if line.strip() == '[config]':
+                where = 'c'; continue
+            if line.strip() == '[learned]':
+                where = 'l'; continue
+            if where == 'c':
+                conf.append(line)
+            elif where == 'l':
+                learned.append(line)
+        return '\n'.join(conf).strip() + '\n', learned
+
+    @staticmethod
+    def _merge_learned(imported):
+        """Слить словарь: свои слова + принесённые, принесённые главнее.
+
+        Ключ — само слово, поэтому дубликатов не возникает: одинаковые
+        просто накладываются друг на друга. Конфликт бывает один —
+        слово есть в обоих, но с разным языком; берём из файла, ведь
+        человек принёс его осознанно.
+        """
+        words = {}
+        for src in (None, imported):
+            lines = []
+            if src is None:
+                try:
+                    with open(LEARNED, encoding='utf-8',
+                              errors='replace') as f:
+                        lines = f.read().splitlines()
+                except OSError:
+                    lines = []
+            else:
+                lines = src
+            for ln in lines:
+                ln = ln.strip()
+                if not ln or ln.startswith('#'):
+                    continue
+                parts = ln.replace('\t', ' ').split()
+                if not parts:
+                    continue
+                lang = parts[1].lower() if len(parts) > 1 else 'us'
+                words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
+        return words
+
+    def on_export(self):
+        now = datetime.datetime.now()
+        fname = 'autoswitch-settings-%s.txt' % now.strftime('%Y%m%d')
+        path = self._file_save(fname, self._export_text())
+        if path:
+            self._show_toast(self.t('exp_done').format(f=path), ms=5000)
+
+    def on_import(self):
+        dlg = Gtk.FileChooserDialog(title=self.t('imp_btn'), parent=self,
+                                    action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons(self.t('cancel'), Gtk.ResponseType.CANCEL,
+                        self.t('imp_btn'), Gtk.ResponseType.OK)
+        path = None
+        if dlg.run() == Gtk.ResponseType.OK:
+            path = dlg.get_filename()
+        dlg.destroy()
+        if not path:
+            return
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            self._show_toast(self.t('imp_bad'))
+            return
+        conf, learned = self._parse_export(text)
+        if conf is None:
+            self._show_toast(self.t('imp_bad'))
+            return
+        if not self._confirm(self.t('imp_ask'),
+                             self.t('imp_ask_m').format(f=path)):
+            return
+        words = self._merge_learned(learned)
+        payload = '\n'.join('%s\t%s' % (w, l) for w, l in sorted(words.items()))
+        run(['pkexec', HELPER, 'write-config'], input_text=conf)
+        run(['pkexec', HELPER, 'write-learned'], input_text=payload + '\n')
+        poke_indicator()
+        self._auto_restart()
+        # дольше обычного: человек должен успеть прочитать итог
+        self._show_toast(self.t('imp_done').format(n=len(words)), ms=6000)
+
+    def save_all_logs(self):
+        text = diag_report(self.t)
+        nlines = len(svc_log_all().splitlines())
+        now = datetime.datetime.now()
+        fname = 'autoswitch-%s-%s-%d.log' % (
+            now.strftime('%Y%m%d'), now.strftime('%H%M'), nlines)
+        self._file_save(fname, text)
+
+    # ── настройки: язык / перезапуск / конфиг ─────────────────────────
+    def _toggle_lang(self):
+        self.lang = 'en' if self.lang == 'ru' else 'ru'
+        cfg_set('ui_lang', self.lang)
+        # перевыпустить конфиг на новом языке, сохранив значения
+        run(['pkexec', HELPER, 'relang-config', self.lang])
+        GLib.idle_add(self._relang)
+
+    def _auto_restart(self):
+        # тихо перезапускаем службу, чтобы настройки применились сами
+        rc, out = svc_action('restart')
+        if rc == 0:
+            self._show_toast(self.t('r_restarting'))
+
+    def _on_lang_change(self, combo):
+        new = combo.get_active_id() or 'ru'
+        if new != self.lang:
+            cfg_set('ui_lang', new)
+            self.lang = new
+            run(['pkexec', HELPER, 'relang-config', new])
+            # перестройку откладываем: нельзя рушить combo прямо в его же
+            # обработчике changed — иначе сегфолт. idle_add даёт GTK
+            # завершить обработку сигнала.
+            GLib.idle_add(self._relang)
+
+    def _show_toast(self, text, ms=1500):
+        self.toast.set_markup(
+            '<span foreground="#000000" weight="bold"> %s </span>' % text)
+        self.toast.show()
+        if self._toast_id:
+            GLib.source_remove(self._toast_id)
+        self._toast_id = GLib.timeout_add(ms, self._hide_toast)
+
+    def _hide_toast(self):
+        self.toast.hide()
+        self._toast_id = None
+        return False
+
+    def _restart_now(self):
+        rc, out = svc_action('restart')
+        if rc != 0 and ('dismiss' in out.lower()
+                        or 'not authorized' in out.lower()):
+            return
+        self.refresh_status()
+        self._show_toast(self.t('r_restarting'))
+
+    def _build_edit(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        bar, self.edit_title = self._topbar(self.t('set_config'))
+        # кнопка Сохранить справа от Назад
+        save = Gtk.Button()
+        save.get_style_context().add_class('mini')
+        slbl = self._lbl(self.t('save'), GREEN, bold=True)
+        save.add(slbl)
+        save.set_tooltip_text(self.t('save'))
+        self._reg_compact(slbl, self.t('save'), '\u2713', GREEN)
+        self._hoverable(save)
+        save.connect('clicked', lambda _b: self._edit_save())
+        bar.pack_end(save, False, False, 0)
+        root.pack_start(bar, False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.edit_view = Gtk.TextView()
+        self.edit_view.set_monospace(True)
+        self.edit_view.set_cursor_visible(True)
+        self.edit_view.get_style_context().add_class('output')
+        self.edit_view.set_left_margin(12); self.edit_view.set_right_margin(12)
+        self.edit_view.set_top_margin(10)
+        self.edit_buf = self.edit_view.get_buffer()
+        scroll.add(self.edit_view)
+        root.pack_start(scroll, True, True, 0)
+        self._edit_path = CONFIG
+        return root
+
+    def _edit_config(self):
+        # правим конфиг во встроенном экране (без запуска root-редактора,
+        # который не имеет доступа к дисплею пользователя)
+        try:
+            with open(CONFIG) as f:
+                _orig = f.read()
+        except Exception:
+            _orig = '# %s\n' % CONFIG
+        self.edit_buf.set_text(_orig)
+        # запоминаем исходный текст: если пользователь ничего не менял,
+        # службу дёргать незачем — она бы зря отключилась на секунду
+        self._edit_orig = _orig
+        self._edit_path = CONFIG
+        self.edit_title.set_markup(
+            '<span foreground="%s" weight="bold">%s</span>'
+            % (CYAN, self.t('set_config')))
+        self._nav_to('edit')
+        GLib.idle_add(self.edit_view.grab_focus)
+
+    def _edit_save(self):
+        s, e = self.edit_buf.get_bounds()
+        text = self.edit_buf.get_text(s, e, True)
+        # Ничего не изменилось — не пишем и не трогаем службу.
+        if text == getattr(self, '_edit_orig', None):
+            self._nav_back()
+            self._show_toast(self.t('cfg_unchanged'))
+            return
+        try:
+            run(['pkexec', HELPER, 'write-config'], input_text=text)
+            # Служба читает конфиг только при старте, поэтому после правки
+            # её надо перезапустить — иначе настройка «не работает», и
+            # человек решает, что программа сломана.
+            run(['pkexec', HELPER, 'service', 'restart'])
+            poke_indicator()
+            self._edit_orig = text
+            self._nav_back()
+            self._show_toast(self.t('cfg_saved_restarted'))
+            self.refresh_status()
+            return
+        except Exception:
+            pass
+        self._nav_back()
+
+    # ── экран исключений (в том же окне) ────────────────────
+    def _build_exclusions(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class('settings-screen')
+        bar, self.ex_title = self._topbar(self.t('ex_title'))
+        save = Gtk.Button()
+        save.get_style_context().add_class('mini')
+        slbl = self._lbl(self.t('save'), GREEN, bold=True)
+        save.add(slbl)
+        save.set_tooltip_text(self.t('save'))
+        self._reg_compact(slbl, self.t('save'), '\u2713', GREEN)
+        self._hoverable(save)
+        save.connect('clicked', lambda _b: self._excl_save())
+        bar.pack_end(save, False, False, 0)
+        # переключатель колонок — виден только на узком окне
+        self.ex_swap = Gtk.Button()
+        self.ex_swap.get_style_context().add_class('mini')
+        self.ex_swap_lbl = self._lbl(self.t('ex_toggle_view'), YELLOW, bold=True)
+        self.ex_swap_lbl.show()
+        self.ex_swap.add(self.ex_swap_lbl)
+        self.ex_swap.set_tooltip_text(self.t('ex_toggle_tip'))
+        self._hoverable(self.ex_swap)
+        self.ex_swap.connect('clicked', lambda _b: self._excl_swap_pane())
+        self.ex_swap.set_no_show_all(True)
+        bar.pack_end(self.ex_swap, False, False, 0)
+        root.pack_start(bar, False, False, 0)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.get_style_context().add_class('settings-body')
+        body.set_border_width(10)
+
+        self.ex_steam = Gtk.CheckButton(label=self.t('ex_steam'))
+        self.ex_steam.get_style_context().add_class('steamrow')
+        self._ellipsize_check(self.ex_steam)
+        self.ex_steam.connect('toggled', lambda _c: self._excl_refresh_count())
+        body.pack_start(self.ex_steam, False, False, 0)
+
+        addcur = Gtk.Button()
+        addcur.get_style_context().add_class('setrow')
+        self.ex_addcur_lbl = self._lbl(self.t('ex_current'), CYAN)
+        self.ex_addcur_lbl.set_halign(Gtk.Align.START)
+        self.ex_addcur_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        addcur.add(self.ex_addcur_lbl)
+        self._hoverable(addcur)
+        addcur.connect('clicked', lambda _b: self._excl_add_current())
+        self.ex_addcur = addcur
+        body.pack_start(addcur, False, False, 0)
+
+        # ── две колонки: слева все приложения, справа добавленные ──
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_wide_handle(True)
+        paned.connect('notify::position', self._excl_pane_moved)
+        self.ex_paned = paned
+
+        # левая колонка
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_size_request(90, -1)
+        hl = self._lbl(self.t('ex_all'), CYAN, bold=True)
+        hl.set_halign(Gtk.Align.START)
+        left.pack_start(hl, False, False, 0)
+        self.ex_search = Gtk.SearchEntry()
+        self.ex_search.set_placeholder_text(self.t('ex_search_btn'))
+        self.ex_search.set_width_chars(1)
+        self.ex_search.connect('search-changed', self._excl_filter)
+        left.pack_start(self.ex_search, False, False, 0)
+        lscroll = Gtk.ScrolledWindow()
+        lscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.ex_scroll = lscroll
+        self.ex_listbox = Gtk.ListBox()
+        self.ex_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        lscroll.add(self.ex_listbox)
+        left.pack_start(lscroll, True, True, 0)
+        paned.pack1(left, True, False)
+
+        # правая колонка
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.set_size_request(85, -1)
+        self.ex_added_lbl = self._lbl(self.t('ex_added'), GREEN, bold=True)
+        self.ex_added_lbl.set_halign(Gtk.Align.START)
+        right.pack_start(self.ex_added_lbl, False, False, 0)
+        rscroll = Gtk.ScrolledWindow()
+        rscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.ex_added_box = Gtk.ListBox()
+        self.ex_added_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        rscroll.add(self.ex_added_box)
+        right.pack_start(rscroll, True, True, 0)
+        self.ex_added_empty = self._lbl(self.t('ex_added_empty'), GRAY)
+        self.ex_added_empty.set_halign(Gtk.Align.START)
+        right.pack_start(self.ex_added_empty, False, False, 0)
+        self.ex_right = right
+        self.ex_left = left
+        paned.pack2(right, True, False)
+
+        body.pack_start(paned, True, True, 0)
+        root.pack_start(body, True, True, 0)
+
+        self.ex_checks = {}      # cls -> CheckButton (левая колонка)
+        self.ex_added = {}       # cls -> ListBoxRow  (правая колонка)
+        self.ex_names = {}       # cls -> отображаемое имя
+        self._ex_sync = False    # защита от рекурсии при синхронизации
+        self._ex_narrow = None   # текущий режим (узкий/широкий)
+        self._ex_pane_pos = None
+        self._ex_pane_shown = 'left'
+        return root
+
+    # ── синхронизация колонок ─────────────────────────────────────────
+    def _excl_toggle(self, cls, on, name=None, manual=False):
+        """Единая точка правды: правая колонка = состав исключений."""
+        if on and cls not in self.ex_added:
+            self.ex_names.setdefault(cls, name or cls)
+            self._excl_added_row(cls, manual)
+        elif not on and cls in self.ex_added:
+            row = self.ex_added.pop(cls)
+            self.ex_added_box.remove(row)
+        chk = self.ex_checks.get(cls)
+        if chk is not None and chk.get_active() != on:
+            self._ex_sync = True
+            chk.set_active(on)
+            self._ex_sync = False
+        self._excl_refresh_count()
+
+    def _excl_added_row(self, cls, manual=False):
+        row = Gtk.ListBoxRow()
+        hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        nm = self.ex_names.get(cls, cls)
+        txt = GLib.markup_escape_text(nm)
+        if manual:
+            txt += ' <span foreground="%s" size="8500">(%s)</span>' % (
+                GRAY, self.t('ex_manual'))
+        lb = Gtk.Label()
+        lb.set_markup('<span foreground="%s">%s</span>' % (FG, txt))
+        lb.set_halign(Gtk.Align.START)
+        lb.set_ellipsize(Pango.EllipsizeMode.END)
+        hb.pack_start(lb, True, True, 0)
+        rm = Gtk.Button()
+        rm.get_style_context().add_class('mini')
+        rm.set_tooltip_text(self.t('ex_rm_hint'))
+        rm.add(self._lbl('\u2715', RED, bold=True))
+        rm.connect('clicked', lambda _b, c=cls: self._excl_toggle(c, False))
+        hb.pack_end(rm, False, False, 0)
+        row.add(hb)
+        row._cls = cls
+        row._btn = rm
+        self._clickable(row, rm)
+        self.ex_added[cls] = row
+        self.ex_added_box.add(row)
+        self.ex_added_box.show_all()
+        return row
+
+    def _excl_steam_sync(self):
+        """Steam — одна строка в «Добавлено» вместо двух wildcard-токенов."""
+        on = self.ex_steam.get_active()
+        row = getattr(self, '_ex_steam_row', None)
+        if on and row is None:
+            r = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            lb = Gtk.Label()
+            lb.set_markup('<span foreground="%s">Steam <span foreground="%s" '
+                          'size="8500">(%s)</span></span>'
+                          % (FG, GRAY, self.t('ex_steam_all')))
+            lb.set_halign(Gtk.Align.START)
+            lb.set_ellipsize(Pango.EllipsizeMode.END)
+            hb.pack_start(lb, True, True, 0)
+            rm = Gtk.Button()
+            rm.get_style_context().add_class('mini')
+            rm.set_tooltip_text(self.t('ex_rm_hint'))
+            rm.add(self._lbl('\u2715', RED, bold=True))
+            rm.connect('clicked',
+                       lambda _b: self.ex_steam.set_active(False))
+            hb.pack_end(rm, False, False, 0)
+            r.add(hb)
+            r._btn = rm
+            self._clickable(r, rm)
+            self._ex_steam_row = r
+            self.ex_added_box.insert(r, 0)
+            self.ex_added_box.show_all()
+        elif not on and row is not None:
+            self.ex_added_box.remove(row)
+            self._ex_steam_row = None
+
+    def _excl_refresh_count(self):
+        self._excl_steam_sync()
+        n = len(self.ex_added) + (1 if self.ex_steam.get_active() else 0)
+        self.ex_added_lbl.set_markup(
+            '<span foreground="%s" weight="bold">%s (%d)</span>'
+            % (GREEN, self.t('ex_added'), n))
+        if self.ex_added:
+            self.ex_added_empty.hide()
+        else:
+            self.ex_added_empty.show()
+
+    # ── левая колонка ─────────────────────────────────────────────────
+    def _excl_add_row(self, cls, nm, active):
+        row = Gtk.ListBoxRow()
+        chk = Gtk.CheckButton(label=nm)
+        self._ellipsize_check(chk)
+        builtin = is_builtin_excluded(cls)
+        if builtin:
+            # окна самой программы: галочка стоит всегда и не снимается
+            active = True
+        chk.set_active(active)
+        if builtin:
+            chk.set_sensitive(False)
+            chk.set_tooltip_text(self.t('ex_builtin_tip'))
+        chk._name = nm.lower()
+        chk.connect('toggled', self._excl_check_toggled, cls, nm)
+        self.ex_checks[cls] = chk
+        self.ex_names[cls] = nm
+        row.add(chk)
+        row._chk = chk
+        self._clickable(row, chk)
+        self.ex_listbox.add(row)
+        return row
+
+    def _excl_check_toggled(self, chk, cls, nm):
+        if self._ex_sync:
+            return
+        self._excl_toggle(cls, chk.get_active(), name=nm)
+
+    def _excl_filter(self, entry):
+        q = entry.get_text().lower().strip()
+        for row in self.ex_listbox.get_children():
+            row.set_visible((q in row._chk._name) if q else True)
+
+    # ── захват активного окна ─────────────────────────────────────────
+    def _excl_add_current(self):
+        """Ловим чужое окно: даём время кликнуть по нему, как sleep 3 в asc."""
+        if getattr(self, '_ex_catch_id', None):
+            return
+        self._ex_caught = ''
+        self._ex_ticks = 10          # 10 x 500мс = 5 секунд
+        self.ex_addcur.set_sensitive(False)
+        self._excl_catch_label()
+        self._ex_catch_id = GLib.timeout_add(500, self._excl_catch_tick)
+
+    def _excl_catch_label(self):
+        secs = (self._ex_ticks + 1) // 2
+        self.ex_addcur_lbl.set_markup(
+            '<span foreground="%s" weight="bold">%s</span>'
+            % (YELLOW, self.t('ex_cur_count') % secs))
+
+    def _excl_catch_tick(self):
+        # опрашиваем каждые 500мс и запоминаем последнее ЧУЖОЕ окно, поэтому
+        # можно вернуться в Autoswitch раньше — класс уже пойман
+        try:
+            cls = current_window_class()
+        except Exception:
+            cls = ''
+        if cls and cls not in SELF_CLASSES:
+            self._ex_caught = cls
+        self._ex_ticks -= 1
+        if self._ex_ticks > 0:
+            self._excl_catch_label()
+            return True
+
+        self._ex_catch_id = None
+        self.ex_addcur.set_sensitive(True)
+        self.ex_addcur_lbl.set_markup(
+            '<span foreground="%s">%s</span>' % (CYAN, self.t('ex_current')))
+
+        cls = self._ex_caught
+        if not cls:
+            self._show_toast(self.t('ex_cur_self'), ms=2600)
+            return False
+        manual = cls not in self.ex_checks
+        self._excl_toggle(cls, True, name=cls, manual=manual)
+        if not manual:
+            self.ex_search.set_text('')
+            GLib.idle_add(self._excl_scroll_to, self.ex_checks[cls].get_parent())
+        self._show_toast('%s: %s' % (self.t('ex_cur_got'), cls), ms=2600)
+        return False
+
+    def _excl_scroll_to(self, row):
+        try:
+            adj = self.ex_scroll.get_vadjustment()
+            y = row.get_allocation().y
+            page = adj.get_page_size()
+            target = max(0, min(y - page / 2.0, adj.get_upper() - page))
+            adj.set_value(target)
+        except Exception:
+            pass
+        return False
+
+    def _excl_cancel_catch(self):
+        if getattr(self, '_ex_catch_id', None):
+            GLib.source_remove(self._ex_catch_id)
+            self._ex_catch_id = None
+        if getattr(self, 'ex_addcur', None):
+            self.ex_addcur.set_sensitive(True)
+            self.ex_addcur_lbl.set_markup(
+                '<span foreground="%s">%s</span>' % (CYAN, self.t('ex_current')))
+
+    # ── адаптив: на узком окне колонки показываются по очереди ────────
+    def _excl_adapt(self, width):
+        self._apply_compact(width < COMPACT_W)
+        if not getattr(self, 'ex_paned', None):
+            return
+        narrow = width < NARROW_W
+        if narrow == self._ex_narrow:
+            return
+        self._ex_narrow = narrow
+        if narrow:
+            self.ex_swap.show()
+            self._excl_show_pane(self._ex_pane_shown)
+        else:
+            self.ex_swap.hide()
+            self.ex_left.show()
+            self.ex_right.show()
+            GLib.idle_add(self._excl_pane_default)
+
+    def _excl_pane_default(self):
+        try:
+            w = self.ex_paned.get_allocated_width()
+            if w > 1:
+                pos = getattr(self, '_ex_pane_pos', None)
+                if pos and 60 < pos < w - 60:
+                    self.ex_paned.set_position(pos)
+                else:
+                    self.ex_paned.set_position(int(w * 0.58))
+        except Exception:
+            pass
+        return False
+
+    def _excl_pane_moved(self, paned, _p):
+        if not self._ex_narrow:
+            self._ex_pane_pos = paned.get_position()
+
+    def _excl_show_pane(self, which):
+        self._ex_pane_shown = which
+        if getattr(self, 'ex_swap_lbl', None):
+            arrow = '\u25b6' if which == 'left' else '\u25c0'
+            self.ex_swap_lbl.set_markup(
+                '<span foreground="%s" weight="bold" size="13000">%s</span>'
+                % (YELLOW, arrow))
+            self.ex_swap.set_tooltip_text(
+                self.t('ex_added' if which == 'left' else 'ex_all'))
+        if which == 'left':
+            self.ex_left.show()
+            self.ex_right.hide()
+        else:
+            self.ex_left.hide()
+            self.ex_right.show()
+
+    def _excl_swap_pane(self):
+        self._excl_show_pane('right' if self._ex_pane_shown == 'left' else 'left')
+
+    # ── загрузка и сохранение ─────────────────────────────────────────
+    def _show_exclusions(self):
+        self._excl_cancel_catch()
+        for row in self.ex_listbox.get_children():
+            self.ex_listbox.remove(row)
+        for row in self.ex_added_box.get_children():
+            self.ex_added_box.remove(row)
+        self._ex_steam_row = None
+        self.ex_checks = {}
+        self.ex_added = {}
+        self.ex_names = {}
+
+        current = [c for c in excl_read() if c]
+        cur_set = set(current)
+        self.ex_steam.set_active(any(t in cur_set for t in STEAM_TOKENS))
+
+        # левая колонка — все приложения системы
+        known = set()
+        for cls, nm in scan_desktops():
+            self._ex_sync = True
+            self._excl_add_row(cls, nm, cls in cur_set)
+            self._ex_sync = False
+            known.add(cls)
+
+        # правая колонка — всё, что реально лежит в конфиге, включая записи
+        # без своего .desktop (пойманные окна и правки руками)
+        for cls in current:
+            if cls in STEAM_TOKENS:
+                continue
+            self._excl_toggle(cls, True, name=self.ex_names.get(cls, cls),
+                              manual=cls not in known)
+
+        self.ex_search.set_text('')
+        self._nav_to('exclusions')
+        self.ex_listbox.show_all()
+        self.ex_added_box.show_all()
+        self._excl_refresh_count()
+        self._ex_narrow = None
+        self._excl_adapt(self.get_allocated_width())
+        # рамка на первом пункте экрана, дальше стрелками вниз по всем
+        GLib.idle_add(self.ex_steam.grab_focus)
+
+    def _excl_save(self):
+        toks = list(self.ex_added.keys())
+        if self.ex_steam.get_active():
+            toks += STEAM_TOKENS
+        # Ничего не изменилось — не пишем конфиг и не дёргаем службу.
+        new_set = set(t for t in toks if t)
+        if new_set == set(excl_read()):
+            self._nav_back()
+            self._show_toast(self.t('cfg_unchanged'))
+            return
+        try:
+            excl_write(toks)      # внутри: запись, перезапуск, сигнал индикатору
+        except Exception:
+            self._nav_back()
+            self._show_toast(self.t('log_clear_fail'))
+            return
+        self._nav_back()
+        self._show_toast(self.t('ex_saved'))
+        self.refresh_status()
+
+    # ── экран тех-словаря (в том же окне) ─────────────────
+    def _build_techdict(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        bar, self.td_title = self._topbar(self.t('m_techdict'))
+        save = Gtk.Button()
+        save.get_style_context().add_class('mini')
+        slbl = self._lbl(self.t('save'), GREEN, bold=True)
+        save.add(slbl)
+        save.set_tooltip_text(self.t('save'))
+        self._reg_compact(slbl, self.t('save'), '\u2713', GREEN)
+        self._hoverable(save)
+        save.connect('clicked', lambda _b: self._td_save())
+        bar.pack_end(save, False, False, 0)
+        root.pack_start(bar, False, False, 0)
+
+        info = Gtk.Label()
+        info.set_markup('<span foreground="%s" size="9500">%s</span>'
+                        % (GRAY, self.t('td_hint')))
+        info.set_halign(Gtk.Align.START)
+        info.set_line_wrap(True)
+        info.set_margin_start(14)
+        info.set_margin_end(14)
+        info.set_margin_top(10)
+        info.set_margin_bottom(6)
+        root.pack_start(info, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.td_view = Gtk.TextView()
+        self.td_view.set_monospace(True)
+        self.td_view.set_cursor_visible(True)
+        self.td_view.get_style_context().add_class('output')
+        self.td_view.set_left_margin(12)
+        self.td_view.set_right_margin(12)
+        self.td_view.set_top_margin(10)
+        self.td_buf = self.td_view.get_buffer()
+        scroll.add(self.td_view)
+        root.pack_start(scroll, True, True, 0)
+        return root
+
+    def _show_techdict(self):
+        # Читаем learned.txt (US-форма) и показываем в человеческом виде:
+        # «идее   ru» вместо «bltt   ru». При сохранении конвертируем назад.
+        lines = []
+        try:
+            with open(LEARNED) as f:
+                for ln in f:
+                    s = ln.strip()
+                    if not s or s.startswith('#'):
+                        continue
+                    parts = s.replace('\t', ' ').split()
+                    if not parts:
+                        continue
+                    form = parts[0]
+                    lang = parts[1].lower() if len(parts) > 1 else 'us'
+                    if lang not in ('ru', 'us'):
+                        lang = 'us'
+                    lines.append('%s\t%s' % (us_to_display(form, lang), lang))
+        except Exception:
+            pass
+        header = self.t('td_file_hint') + '\n\n'
+        self.td_buf.set_text(header + '\n'.join(lines) + ('\n' if lines else ''))
+        self._nav_to('techdict')
+        GLib.idle_add(self.td_view.grab_focus)
+
+    def _td_save(self):
+        s, e = self.td_buf.get_bounds()
+        text = self.td_buf.get_text(s, e, True)
+        # Конвертируем человеческий вид обратно в US-форму для learned.txt
+        out = []
+        for ln in text.splitlines():
+            st = ln.strip()
+            if not st or st.startswith('#'):
+                continue
+            parts = st.replace('\t', ' ').split()
+            if not parts:
+                continue
+            word = parts[0]
+            lang = parts[1].lower() if len(parts) > 1 else 'us'
+            if lang not in ('ru', 'us'):
+                lang = 'us'
+            out.append('%s\t%s' % (display_to_us(word), lang))
+        payload = '\n'.join(out) + ('\n' if out else '')
+        try:
+            run(['pkexec', HELPER, 'write-learned'], input_text=payload)
+        except Exception:
+            pass
+        self._nav_back()
+        self._show_toast(self.t('saved'))
+
+
+def _single_instance():
+    """Один экземпляр GUI на пользователя.
+
+    Держим unix-сокет в runtime-каталоге. Если он уже кем-то слушается —
+    значит окно открыто: стучимся туда, чтобы его подняли, и выходим.
+    Возвращает слушающий сокет либо None, если запускаться не нужно.
+    """
+    path = os.path.join(GLib.get_user_runtime_dir() or '/tmp',
+                        'autoswitch-gui.sock')
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(path)
+        probe.sendall(b'present')
+        return None
+    except OSError:
+        pass
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+    # сокет остался от упавшего процесса — убираем и занимаем сами
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(5)
+        srv.setblocking(False)
+    except OSError:
+        return None
+    atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+    return srv
+
+
+def main():
+    GLib.set_prgname('autoswitch')
+    GLib.set_application_name('Autoswitch')
+    srv = _single_instance()
+    if srv is None:
+        sys.exit(0)
+    win = AscGui()
+    win.attach_ipc(srv)
+    win.connect('destroy', Gtk.main_quit)
+    win.show_all()
+    win.bottom_bar.hide()
+    win.about_bar.hide()
+    GLib.idle_add(win._restore_window_state)
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

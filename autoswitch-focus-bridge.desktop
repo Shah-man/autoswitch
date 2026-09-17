@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Autoswitch Focus Bridge
+GenericName=Active Window Reporter
+Comment=Reports the active window class to autoswitch (Plasma Wayland)
+Comment[ru]=Сообщает autoswitch класс активного окна (Plasma Wayland)
+Exec=autoswitch-focus-bridge
+Icon=autoswitch-indicator
+Terminal=false
+NoDisplay=true
+Categories=Utility;
+X-GNOME-Autostart-enabled=false
+# Только Plasma: в GNOME класс окна отдаёт расширение, на X11 движок
+# читает его сам через xlib, в sway и Hyprland — штатным CLI композитора.
+OnlyShowIn=KDE;

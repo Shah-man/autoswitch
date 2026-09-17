@@ -1,0 +1,1539 @@
+#!/usr/bin/env bash
+# installasc — установщик autoswitch. Работает на любой системе с systemd.
+#
+# Зависимости ставятся сами, имена пакетов подбираются под дистрибутив.
+# Поддержаны: ALT Linux, Debian/Ubuntu/Kali, Fedora/RHEL, Arch, openSUSE.
+# На ALT пакеты запрашиваются по возможностям RPM — python3(evdev),
+# typelib(Gtk) и путям файлов словарей. Так надёжнее: имена пакетов
+# от версии к версии меняются, а возможности остаются.
+set -euo pipefail
+
+# ── язык интерфейса ────────────────────────────────────────────────────
+# Выбор ОДНОЙ клавишей: 1 = русский, 2 = English — установка стартует сразу
+# после нажатия, без Enter. В неинтерактивном режиме (пайп, cron, массовая
+# корпоративная раскатка — нет терминала на входе) вопрос не задаётся и
+# берётся АНГЛИЙСКИЙ по умолчанию, чтобы развёртывание не зависало на
+# приглашении. Принудительно: ASC_LANG=ru|en ./installasc
+UILANG=en
+choose_lang() {
+    case "${ASC_LANG:-}" in ru|en) UILANG="$ASC_LANG"; return ;; esac
+    if [ ! -t 0 ]; then UILANG=en; return; fi
+    printf 'Язык / Language:  [1] Русский   [2] English : '
+    local k
+    IFS= read -rsn1 k
+    echo
+    case "$k" in
+        1) UILANG=ru ;;
+        *) UILANG=en ;;
+    esac
+}
+
+# t КЛЮЧ — простые строки. Строки с подстановками оформлены как шаблоны
+# printf (%s) и вызываются через tf КЛЮЧ арг...
+t() {
+    case "$1:$UILANG" in
+        title:ru)      echo "== Установка autoswitch ==" ;;
+        title:en)      echo "== Installing autoswitch ==" ;;
+        s1:ru)         echo "[1/9] Зависимости..." ;;
+        s1:en)         echo "[1/9] Dependencies..." ;;
+        s2:ru)         echo "[2/9] Модуль uinput..." ;;
+        s2:en)         echo "[2/9] uinput module..." ;;
+        s3:ru)         echo "[3/9] Файлы движка..." ;;
+        s3:en)         echo "[3/9] Engine files..." ;;
+        s4:ru)         echo "[4/9] Ярлык в меню приложений..." ;;
+        s4:en)         echo "[4/9] Application menu entry..." ;;
+        s5:ru)         echo "[5/9] Индикатор в трее..." ;;
+        s5:en)         echo "[5/9] Tray indicator..." ;;
+        s6:ru)         echo "[6/9] Расширение GNOME Shell..." ;;
+        s6:en)         echo "[6/9] GNOME Shell extension..." ;;
+        s7:ru)         echo "[7/9] Служба systemd..." ;;
+        s7:en)         echo "[7/9] systemd service..." ;;
+        s8:ru)         echo "[8/9] Включение и запуск..." ;;
+        s8:en)         echo "[8/9] Enable and start..." ;;
+        s9:ru)         echo "[9/9] Каталог исходников..." ;;
+        s9:en)         echo "[9/9] Source directory..." ;;
+        dep_appind_req:ru) echo "    (окружение без XEmbed-трея — AppIndicator обязателен)" ;;
+        dep_appind_req:en) echo "    (environment without XEmbed tray — AppIndicator is required)" ;;
+        dep_lshell_req:ru) echo "    (wlroots-композитор — без layer-shell меню встанет не на месте)" ;;
+        dep_lshell_req:en) echo "    (wlroots compositor — without layer-shell the menu is misplaced)" ;;
+        dep_nogfx:ru)  echo "    графической сессии нет — индикатор не устанавливается" ;;
+        dep_nogfx:en)  echo "    no graphical session — indicator is not installed" ;;
+        dep_fail_hdr:ru) echo "Не установлены обязательные зависимости:" ;;
+        dep_fail_hdr:en) echo "Required dependencies were not installed:" ;;
+        dep_fail_tip:ru) echo "Установите их вручную и запустите установщик снова." ;;
+        dep_fail_tip:en) echo "Install them manually and run the installer again." ;;
+        cfg_hk:ru)     echo "    из конфига убран неработавший ключ switch_hotkey" ;;
+        cfg_hk:en)     echo "    removed dead key switch_hotkey from config" ;;
+        cfg_pr:ru)     echo "    из конфига убран устаревший ключ priority_layout (заменён обучением)" ;;
+        cfg_pr:en)     echo "    removed obsolete key priority_layout from config (replaced by learning)" ;;
+        plasma_noind:ru) echo "    обнаружена Plasma — GTK-индикатор не нужен, его роль у апплета" ;;
+        plasma_noind:en) echo "    Plasma detected — GTK indicator not needed, the applet covers it" ;;
+        kwin_ok:ru)    echo "    KWin-скрипт установлен и включён" ;;
+        kwin_ok:en)    echo "    KWin script installed and enabled" ;;
+        applet_auto_fail:ru) echo "    автоматически не вышло" ;;
+        applet_auto_fail:en) echo "    automatic install failed" ;;
+        ind_nofile:ru) echo "    файла индикатора нет в сборке, пропускаю" ;;
+        ind_nofile:en) echo "    indicator file missing in build, skipping" ;;
+        ind_nogfx:ru)  echo "    графической сессии нет, пропускаю" ;;
+        ind_nogfx:en)  echo "    no graphical session, skipping" ;;
+        gs_notfound:ru) echo "    GNOME Shell не найден, пропускаю" ;;
+        gs_notfound:en) echo "    GNOME Shell not found, skipping" ;;
+        ext_nobuild:ru) echo "    расширения нет в сборке, пропускаю" ;;
+        ext_nobuild:en) echo "    extension missing in build, skipping" ;;
+        ext_nouser:ru) echo "    не определить пользователя сессии, пропускаю" ;;
+        ext_nouser:en) echo "    cannot determine session user, skipping" ;;
+        schema_warn1:ru) echo "    ВНИМАНИЕ: не удалось собрать схемы расширения." ;;
+        schema_warn1:en) echo "    WARNING: failed to compile extension schemas." ;;
+        schema_warn2:ru) echo "    Индикатор и исключения работать не будут." ;;
+        schema_warn2:en) echo "    Indicator and exclusions will not work." ;;
+        ext_enabled:ru) echo "    включено" ;;
+        ext_enabled:en) echo "    enabled" ;;
+        ext_enable_later:ru) echo "    включить сейчас не вышло — команда после перезахода:" ;;
+        ext_enable_later:en) echo "    could not enable now — run after re-login:" ;;
+        src_nohome:ru) echo "    не определить домашний каталог, пропускаю" ;;
+        src_nohome:en) echo "    cannot determine home directory, skipping" ;;
+        preset_cfg:ru) echo "    настройки применены" ;;
+        preset_cfg:en) echo "    settings applied" ;;
+        done:ru)       echo "== Готово ==" ;;
+        done:en)       echo "== Done ==" ;;
+        help_menu:ru)  echo "  asc         — открыть меню" ;;
+        help_menu:en)  echo "  asc         — open menu" ;;
+        help_cmds:ru)  echo "  asc help    — список команд" ;;
+        help_cmds:en)  echo "  asc help    — list of commands" ;;
+        help_uninstall:ru) echo "  удаление:   sudo ./installasc --uninstall" ;;
+        help_uninstall:en) echo "  uninstall:  sudo ./installasc --uninstall" ;;
+        ext_updated1:ru) echo "Расширение GNOME обновлено. Оболочка подхватит новую версию" ;;
+        ext_updated1:en) echo "GNOME extension updated. The shell will pick up the new version" ;;
+        ext_updated2:ru) echo "после выхода из сессии и повторного входа." ;;
+        ext_updated2:en) echo "after you log out and log back in." ;;
+        plasmoid_todo1:ru) echo "Осталось поставить апплет панели (БЕЗ sudo — он ставится" ;;
+        plasmoid_todo1:en) echo "One step left: install the panel applet (WITHOUT sudo — it goes" ;;
+        plasmoid_todo2:ru) echo "в профиль пользователя, из-под root Plasma его не увидит):" ;;
+        plasmoid_todo2:en) echo "into the user profile; run as root Plasma won't see it):" ;;
+        kb_one1:ru)    echo "ВНИМАНИЕ: похоже, в системе настроена только одна раскладка клавиатуры." ;;
+        kb_one1:en)    echo "WARNING: it looks like only one keyboard layout is configured." ;;
+        kb_one2:ru)    echo "Autoswitch переключает раскладки — со второй ему будет что переключать." ;;
+        kb_one2:en)    echo "Autoswitch switches layouts — it needs a second one to switch to." ;;
+        kb_one3:ru)    echo "Добавьте вторую в настройках клавиатуры вашего окружения (обычно английская и русская)." ;;
+        kb_one3:en)    echo "Add a second one in your desktop keyboard settings (usually English and Russian)." ;;
+        plasmoid_warn1:ru) echo "ВНИМАНИЕ: каталог апплета панели не найден рядом со сборкой." ;;
+        plasmoid_warn1:en) echo "WARNING: panel applet directory not found next to the build." ;;
+        plasmoid_warn2:ru) echo "Без него на Plasma не будет значка в трее совсем." ;;
+        plasmoid_warn2:en) echo "Without it Plasma will have no tray icon at all." ;;
+        plasmoid_warn3:ru) echo "Распакуйте апплет и запустите его install-plasmoid без sudo." ;;
+        plasmoid_warn3:en) echo "Unpack the applet and run its install-plasmoid without sudo." ;;
+        ses_hdr:ru)    echo "Как определилась сессия:" ;;
+        ses_hdr:en)    echo "How the session was detected:" ;;
+        un_title:ru)   echo "== Удаление autoswitch ==" ;;
+        un_title:en)   echo "== Uninstalling autoswitch ==" ;;
+        un_ask:ru)     echo "Удалить настройки, ваш словарь и выученные слова? [y/N]: " ;;
+        un_ask:en)     echo "Remove settings, your dictionary and learned words? [y/N]: " ;;
+        un_cfg_removed:ru) echo "  настройки удалены" ;;
+        un_cfg_removed:en) echo "  settings removed" ;;
+        un_cfg_kept:ru)    echo "  настройки оставлены" ;;
+        un_cfg_kept:en)    echo "  settings kept" ;;
+        un_ext_removed:ru) echo "  расширение GNOME удалено" ;;
+        un_ext_removed:en) echo "  GNOME extension removed" ;;
+        un_kwin_removed:ru) echo "  KWin-скрипт удалён" ;;
+        un_kwin_removed:en) echo "  KWin script removed" ;;
+        un_plasmoid_removed:ru) echo "  апплет Plasma удалён" ;;
+        un_plasmoid_removed:en) echo "  Plasma applet removed" ;;
+        un_done:ru)    echo "== autoswitch удалён ==" ;;
+        un_done:en)    echo "== autoswitch removed ==" ;;
+        ses_see:ru)    echo "  (см. asc → Журнал)" ;;
+        ses_see:en)    echo "  (see asc → Journal)" ;;
+        ind_restarted:ru) echo "    установлен и перезапущен" ;;
+        ind_restarted:en) echo "    installed and restarted" ;;
+        ind_started:ru)   echo "    установлен и запущен" ;;
+        ind_started:en)   echo "    installed and started" ;;
+        ext_act_updated:ru) echo "обновлено" ;;
+        ext_act_updated:en) echo "updated" ;;
+        ext_act_installed:ru) echo "установлено" ;;
+        ext_act_installed:en) echo "installed" ;;
+        ext_act_same:ru) echo "уже стоит и совпадает с этой сборкой" ;;
+        ext_act_same:en) echo "already installed and matches this build" ;;
+        dh_evdev:ru)   echo "чтение клавиатуры (python-evdev)" ;;
+        dh_evdev:en)   echo "keyboard reading (python-evdev)" ;;
+        dh_xlib:ru)    echo "работа с X11 (python-xlib)" ;;
+        dh_xlib:en)    echo "X11 support (python-xlib)" ;;
+        dh_gi:ru)      echo "привязки GTK для индикатора (PyGObject)" ;;
+        dh_gi:en)      echo "GTK bindings for the indicator (PyGObject)" ;;
+        dh_gtk3:ru)    echo "библиотека GTK 3" ;;
+        dh_gtk3:en)    echo "GTK 3 library" ;;
+        dh_appind:ru)  echo "индикатор в трее (AppIndicator)" ;;
+        dh_appind:en)  echo "tray indicator (AppIndicator)" ;;
+        dh_lshell:ru)  echo "положение меню индикатора (gtk-layer-shell)" ;;
+        dh_lshell:en)  echo "indicator menu placement (gtk-layer-shell)" ;;
+        dh_vte:ru)     echo "окно меню asc (VTE)" ;;
+        dh_vte:en)     echo "asc menu window (VTE)" ;;
+        dh_cairo:ru)   echo "снимок плитки при перетаскивании (pycairo)" ;;
+        dh_cairo:en)   echo "tile snapshot while dragging (pycairo)" ;;
+        dh_dialog:ru)  echo "текстовое меню (dialog)" ;;
+        dh_dialog:en)  echo "text menu (dialog)" ;;
+        dh_dictru:ru)  echo "русский словарь hunspell" ;;
+        dh_dictru:en)  echo "Russian hunspell dictionary" ;;
+        dh_dicten:ru)  echo "английский словарь hunspell" ;;
+        dh_dicten:en)  echo "English hunspell dictionary" ;;
+        *)             echo "$1" ;;
+    esac
+}
+
+# tf КЛЮЧ арг... — строка с подстановками через printf-шаблон
+tf() {
+    local key="$1"; shift
+    local fmt
+    case "$key:$UILANG" in
+        preset_found:ru) fmt='  найден файл настроек: %s\n' ;;
+        preset_found:en) fmt='  settings file found: %s\n' ;;
+        preset_lang:ru)  fmt='    язык взят из файла: %s\n' ;;
+        preset_lang:en)  fmt='    language taken from the file: %s\n' ;;
+        preset_words:ru) fmt='    словарь: добавлено слов: %s\n' ;;
+        preset_words:en) fmt='    dictionary: words added: %s\n' ;;
+        distro:ru)     fmt='  дистрибутив: %s\n' ;;
+        distro:en)     fmt='  distribution: %s\n' ;;
+        dep_have:ru)   fmt='    уже есть: %s\n' ;;
+        dep_have:en)   fmt='    already present: %s\n' ;;
+        dep_inst:ru)   fmt='    установлено: %s  [%s]\n' ;;
+        dep_inst:en)   fmt='    installed: %s  [%s]\n' ;;
+        dep_skip:ru)   fmt='    ПРОПУЩЕНО (необязательно): %s\n' ;;
+        dep_skip:en)   fmt='    SKIPPED (optional): %s\n' ;;
+        dep_nfail:ru)  fmt='    НЕ УДАЛОСЬ: %s\n' ;;
+        dep_nfail:en)  fmt='    FAILED: %s\n' ;;
+        dep_tried:ru)  fmt='      попробованы пакеты: %s\n' ;;
+        dep_tried:en)  fmt='      tried packages: %s\n' ;;
+        link:ru)       fmt='    ссылка: %s -> %s\n' ;;
+        link:en)       fmt='    symlink: %s -> %s\n' ;;
+        migrated:ru)   fmt='    в «Мой словарь» (learned.txt) перенесено слов: %s\n' ;;
+        migrated:en)   fmt='    words migrated into "My dictionary" (learned.txt): %s\n' ;;
+        applet_do:ru)  fmt='    ставлю апплет панели от имени %s:\n' ;;
+        applet_do:en)  fmt='    installing panel applet as %s:\n' ;;
+        bak:ru)        fmt='    прежнее содержимое: %s\n' ;;
+        bak:en)        fmt='    previous content: %s\n' ;;
+        src_here:ru)   fmt='    запущено из %s — уже на месте\n' ;;
+        src_here:en)   fmt='    run from %s — already in place\n' ;;
+        src_laid:ru)   fmt='    исходники разложены в %s\n' ;;
+        src_laid:en)   fmt='    sources placed in %s\n' ;;
+        reinstall:ru)  fmt='  переустановка без сети: cd %s && sudo ./installasc\n' ;;
+        reinstall:en)  fmt='  offline reinstall: cd %s && sudo ./installasc\n' ;;
+        *)             fmt="$key\n" ;;
+    esac
+    printf "$fmt" "$@"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Запускать от root: sudo ./installasc"
+    echo "Run as root:       sudo ./installasc"
+    exit 1
+fi
+
+LIBDIR="/usr/local/lib/autoswitch"
+BINDIR="/usr/local/bin"
+CFGDIR="/etc/autoswitch"
+APPDIR="/usr/share/applications"
+AUTOSTARTDIR="/etc/xdg/autostart"
+POLKITDIR="/etc/polkit-1/rules.d"
+POLKITACTDIR="/usr/share/polkit-1/actions"
+ICONDIR="/usr/share/icons/hicolor/scalable/apps"
+SRC="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------- готовый файл настроек рядом с установщиком ----------
+# Смысл: поставить сразу с нужными настройками, ничего не вводя руками.
+# На образцовой машине делается экспорт (asc → Настройки → Экспорт), файл
+# кладётся рядом с установщиком — и на остальных машинах установка идёт
+# одной командой. Файла нет — всё как раньше, ни одного лишнего вопроса.
+# Ищем в двух местах: рядом со скриптом и там, откуда его запустили —
+# файл могли положить и внутрь распакованной папки, и рядом с архивом.
+PRESET=""
+find_preset() {
+    local d f
+    for d in "$SRC" "$PWD"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/autoswitch-settings-*.txt; do
+            [ -r "$f" ] || continue
+            # первая строка — метка экспорта, иначе это чужой файл
+            head -1 "$f" | grep -q '^# autoswitch settings export' || continue
+            PRESET="$f"
+            return 0
+        done
+    done
+    return 1
+}
+
+# Язык из найденного файла. Читаем только часть [config]: в словаре ниже
+# может встретиться слово, похожее на ключ.
+preset_lang() {
+    awk '/^\[learned\]$/ { exit }
+         /^ui_lang=/ { sub(/^ui_lang=/, ""); gsub(/[ \t\r]/, ""); print; exit }' \
+        "$PRESET" 2>/dev/null
+}
+
+do_uninstall() {
+    echo "$(t un_title)"
+    DESK_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+    DESK_HOME="$(getent passwd "$DESK_USER" | cut -d: -f6)"
+    EXT_UUID="autoswitch@shah-man.github.io"
+
+# --- служба ---
+systemctl stop autoswitch 2>/dev/null || true
+systemctl disable autoswitch 2>/dev/null || true
+rm -f /etc/systemd/system/autoswitch.service
+systemctl daemon-reload 2>/dev/null || true
+
+# --- индикатор ---
+# он запускается в сессии пользователя, поэтому сначала снимаем работающий
+pkill -f autoswitch-indicator 2>/dev/null || true
+rm -f /usr/local/bin/autoswitch-indicator
+rm -f /usr/share/applications/autoswitch-indicator.desktop
+rm -f /etc/xdg/autostart/autoswitch-indicator.desktop
+rm -f /etc/polkit-1/rules.d/49-autoswitch.rules
+rm -f /usr/share/polkit-1/actions/org.autoswitch.helper.policy
+
+# --- расширение GNOME и апплет Plasma ---
+# Оба живут в профиле пользователя, а скрипт работает от root, поэтому
+# путь берём у того, кто вызвал sudo.
+
+# Запуск команды в сессии пользователя: и gnome-extensions, и dconf, и
+# kpackagetool6 ходят на шину сеанса, от root они её не видят.
+run_as_user() {
+    local uid
+    uid="$(id -u "$DESK_USER" 2>/dev/null)" || return 1
+    [ -n "$uid" ] || return 1
+    local envv=(
+        "HOME=$DESK_HOME"
+        "XDG_RUNTIME_DIR=/run/user/$uid"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+    )
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$DESK_USER" -- env "${envv[@]}" "$@"
+    else
+        sudo -u "$DESK_USER" env "${envv[@]}" "$@"
+    fi
+}
+
+if [ -n "$DESK_HOME" ] && [ "$DESK_USER" != root ]; then
+    EXT_DIR="$DESK_HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+    if [ -d "$EXT_DIR" ]; then
+        # Сначала выключаем, потом удаляем каталог. Иначе UUID остаётся в
+        # ключе enabled-extensions, и оболочка ругается на расширение,
+        # которого уже нет на диске.
+        if command -v gnome-extensions >/dev/null 2>&1; then
+            run_as_user gnome-extensions disable "$EXT_UUID" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$EXT_DIR"
+        echo "$(t un_ext_removed)"
+    fi
+
+    # KWin-скрипт и его приёмник
+    KWIN_DIR="$DESK_HOME/.local/share/kwin/scripts/autoswitch"
+    if [ -d "$KWIN_DIR" ]; then
+        if command -v kwriteconfig6 >/dev/null 2>&1; then
+            run_as_user kwriteconfig6 --file kwinrc \
+                --group Plugins --key autoswitchEnabled false >/dev/null 2>&1 || true
+        fi
+        rm -rf "$KWIN_DIR"
+        run_as_user gdbus call --session -d org.kde.KWin -o /KWin \
+            -m org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+        echo "$(t un_kwin_removed)"
+    fi
+
+    run_as_user systemctl --user stop autoswitch-focus-bridge >/dev/null 2>&1 || true
+    pkill -f autoswitch-focus-bridge 2>/dev/null || true
+
+    if command -v kpackagetool6 >/dev/null 2>&1; then
+        run_as_user kpackagetool6 --type Plasma/Applet \
+            --remove org.shah-man.autoswitch >/dev/null 2>&1 \
+            && echo "$(t un_plasmoid_removed)"
+    fi
+fi
+
+rm -f /usr/local/bin/autoswitch-focus-bridge
+rm -f /etc/xdg/autostart/autoswitch-focus-bridge.desktop
+
+# --- движок ---
+rm -rf /usr/local/lib/autoswitch
+rm -f  /usr/local/bin/asc
+rm -f  /usr/local/bin/asc-gui
+rm -f  /usr/local/bin/asc-helper
+rm -f  /usr/local/bin/asc-term
+rm -f  /usr/share/applications/autoswitch.desktop
+rm -f  /usr/share/icons/hicolor/scalable/apps/autoswitch.svg
+for _sz in 16 22 24 32 48 64 96 128 192 256 512; do
+    rm -f "/usr/share/icons/hicolor/${_sz}x${_sz}/apps/autoswitch.png"
+done
+rm -f  /etc/modules-load.d/autoswitch-uinput.conf
+
+# копии значков состояния в домашней теме (их кладёт индикатор для панелей,
+# которые не читают IconThemePath, — LXQt и подобные)
+if [ -n "$DESK_HOME" ]; then
+    rm -f "$DESK_HOME"/.local/share/icons/hicolor/scalable/apps/autoswitch-*.svg
+fi
+
+command -v update-desktop-database >/dev/null 2>&1 && \
+    update-desktop-database /usr/share/applications 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+
+# --- настройки пользователя ---
+IND_CFG=""
+[ -n "$DESK_HOME" ] && IND_CFG="$DESK_HOME/.config/autoswitch"
+
+if [ -d /etc/autoswitch ] || { [ -n "$IND_CFG" ] && [ -d "$IND_CFG" ]; }; then
+    printf '%s' "$(t un_ask)"
+    read -r ans
+    case "$ans" in
+        y|Y|д|Д)
+            rm -rf /etc/autoswitch
+            # журнал с набранными словами тоже убираем
+            [ -n "$DESK_HOME" ] && rm -rf "$DESK_HOME/Applications/autoswitch.logs"
+            [ -n "$IND_CFG" ] && rm -rf "$IND_CFG"
+            # значения расширения живут в dconf и переживают удаление файлов
+            if command -v dconf >/dev/null 2>&1; then
+                run_as_user dconf reset -f \
+                    /org/gnome/shell/extensions/autoswitch/ >/dev/null 2>&1 || true
+            fi
+            echo "$(t un_cfg_removed)"
+            ;;
+        *)  echo "$(t un_cfg_kept)" ;;
+    esac
+fi
+
+echo "$(t un_done)"
+    exit 0
+}
+
+# Язык: из файла настроек, если он найден и язык в нём указан. Спрашивать
+# незачем — человек не просто так делал экспорт, выбор уже сделан им.
+find_preset || true
+PRESET_LANG=""
+if [ -n "$PRESET" ]; then
+    PRESET_LANG="$(preset_lang)"
+fi
+case "$PRESET_LANG" in
+    ru|en) UILANG="$PRESET_LANG" ;;
+    *)     choose_lang ;;
+esac
+
+# режим удаления: installasc --uninstall (единый скрипт, как в других
+# проектах). Без флага — установка.
+case "${1:-}" in
+    --help|-h)
+        if [ "$UILANG" = ru ]; then
+            echo "autoswitch — установщик"
+            echo "  sudo ./installasc              установка"
+            echo "  sudo ./installasc --uninstall  удаление"
+            echo "  ASC_LANG=ru|en ./installasc    язык без вопроса"
+        else
+            echo "autoswitch — installer"
+            echo "  sudo ./installasc              install"
+            echo "  sudo ./installasc --uninstall  uninstall"
+            echo "  ASC_LANG=ru|en ./installasc    language without prompt"
+        fi
+        exit 0
+        ;;
+    --uninstall|--remove)
+        do_uninstall
+        ;;
+esac
+
+# Заставка. Не украшательство: человек, запустивший установку из
+# терминала, должен сразу видеть, ЧТО именно ставится. Название набрано
+# шрифтом figlet «small», «Config» под «Autoswitch» — ширина 45 знаков,
+# влезает даже в неразвёрнутое окно. Цвет ярко-зелёный: он читается как
+# «всё в порядке, безопасно». Только при выводе на терминал: в файл или
+# через конвейер уходит чистый текст, без управляющих кодов.
+banner() {
+    local c="" n=""
+    if [ -t 1 ]; then c=$'\033[1;92m'; n=$'\033[0m'; fi
+    printf '%s' "$c"
+    cat << 'BANNER'
+     _       _                 _ _      _
+    /_\ _  _| |_ ___ ____ __ _(_) |_ __| |_
+   / _ \ || |  _/ _ (_-< V  V / |  _/ _| ' \
+  /_/ \_\_,_|\__\___/__/\_/\_/|_|\__\__|_||_|
+            ___           __ _
+           / __|___ _ _  / _(_)__ _
+          | (__/ _ \ ' \|  _| / _` |
+           \___\___/_||_|_| |_\__, |
+                              |___/
+BANNER
+    printf '%s' "$n"
+    echo
+}
+
+banner
+echo "$(t title)"
+
+# ---------------------------------------------------------------- дистрибутив
+detect_distro() {
+    local id="" like=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-}"
+        like="${ID_LIKE:-}"
+    fi
+    case " $id $like " in
+        *altlinux*)                 echo alt;    return ;;
+        *debian*|*ubuntu*)          echo debian; return ;;
+        *fedora*|*rhel*|*centos*)   echo fedora; return ;;
+        *arch*)                     echo arch;   return ;;
+        *suse*)                     echo suse;   return ;;
+    esac
+    # если os-release не помог — по пакетному менеджеру.
+    # apt есть и в Debian, и в ALT, различаем по наличию rpm
+    if command -v apt-get >/dev/null 2>&1; then
+        if command -v rpm >/dev/null 2>&1; then echo alt; else echo debian; fi
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        echo fedora
+    elif command -v pacman >/dev/null 2>&1; then
+        echo arch
+    elif command -v zypper >/dev/null 2>&1; then
+        echo suse
+    else
+        echo unknown
+    fi
+}
+
+DISTRO="$(detect_distro)"
+tf distro "$DISTRO"
+
+pm_update() {
+    case "$DISTRO" in
+        alt|debian) apt-get update -qq || true ;;
+        arch)       pacman -Sy --noconfirm >/dev/null 2>&1 || true ;;
+        *)          : ;;
+    esac
+}
+
+# Установить пакет. Возвращает 0 при успехе, 1 при неудаче —
+# вызывающий перебирает варианты имён дальше.
+pm_install() {
+    local pkg="$1"
+    case "$DISTRO" in
+        alt|debian) apt-get install -y "$pkg" >/dev/null 2>&1 ;;
+        fedora)     { command -v dnf >/dev/null && dnf install -y "$pkg" \
+                      || yum install -y "$pkg"; } >/dev/null 2>&1 ;;
+        arch)       pacman -S --noconfirm "$pkg" >/dev/null 2>&1 ;;
+        suse)       zypper --non-interactive install "$pkg" >/dev/null 2>&1 ;;
+        *)          return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------- поиск словарей
+# Движок читает /usr/share/hunspell/{ru_RU,en_US}.dic. Но дистрибутивы
+# кладут словари по-разному: в myspell, в подкаталоги, под другими
+# именами. Ищем файл где угодно, а потом подставим ссылку туда, где
+# движок его ждёт.
+find_dic() {
+    local lang="$1" short="${1%%_*}" p
+    for p in "/usr/share/hunspell/$lang.dic" \
+             "/usr/share/myspell/$lang.dic" \
+             "/usr/share/myspell/dicts/$lang.dic" \
+             "/usr/share/hunspell/$short.dic" \
+             "/usr/share/dict/hunspell/$lang.dic"; do
+        [ -f "$p" ] && { echo "$p"; return 0; }
+    done
+    p="$(find /usr/share -maxdepth 4 -name "$lang.dic" 2>/dev/null | head -1)"
+    [ -n "$p" ] && { echo "$p"; return 0; }
+    return 1
+}
+
+# ------------------------------------------------------------- проверки нужд
+have_dep() {
+    case "$1" in
+        evdev)   python3 -c "import evdev" 2>/dev/null ;;
+        xlib)    python3 -c "import Xlib"  2>/dev/null ;;
+        gi)      # Мало проверить импорт: если PyGObject не установлен, в
+                 # некоторых системах остаётся пустой namespace-пакет gi,
+                 # который импортируется, но ничего не умеет. Проверяем, что
+                 # модуль настоящий — по наличию require_version.
+                 python3 -c "import gi; gi.require_version" 2>/dev/null ;;
+        gtk3)    python3 -c "import gi; gi.require_version('Gtk','3.0')" 2>/dev/null ;;
+        appind)  python3 -c "import gi; gi.require_version('AyatanaAppIndicator3','0.1')" 2>/dev/null \
+              || python3 -c "import gi; gi.require_version('AppIndicator3','0.1')" 2>/dev/null ;;
+        lshell)  # мало самой библиотеки: Python видит её только через
+                 # GIR-данные, а они кое-где лежат в отдельном пакете
+                 python3 -c "import gi; gi.require_version('GtkLayerShell','0.1')" 2>/dev/null ;;
+        vte)     python3 -c "import gi; gi.require_version('Vte','2.91')" 2>/dev/null ;;
+        cairo)   python3 -c "import gi; gi.require_foreign('cairo')" 2>/dev/null ;;
+        dialog)  command -v dialog >/dev/null 2>&1 ;;
+        dict-ru) find_dic ru_RU >/dev/null ;;
+        dict-en) find_dic en_US >/dev/null ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Варианты имён пакетов, перебираются по порядку до первого успеха.
+dep_candidates() {
+    local dep="$1"
+    case "$DISTRO:$dep" in
+        # --- ALT: сначала возможность RPM, потом привычное имя ---
+        alt:evdev)    echo "python3-module-evdev python3(evdev)" ;;
+        alt:xlib)     echo "python3-module-pyxlib python3(Xlib)" ;;
+        alt:gi)       echo "python3-module-pygobject3 python3(gi)" ;;
+        alt:gtk3)     echo "typelib(Gtk)=3.0 libgtk+3-gir" ;;
+        alt:appind)   echo "typelib(AyatanaAppIndicator3)=0.1 libayatana-appindicator-gir typelib(AppIndicator3)=0.1" ;;
+        alt:lshell)   echo "typelib(GtkLayerShell)=0.1 libgtk-layer-shell-gir libgtk-layer-shell" ;;
+        alt:vte)      echo "typelib(Vte)=2.91 libvte3-gir" ;;
+        alt:cairo)    echo "python3-module-pycairo python3(cairo) python3-module-pygobject3 python3-modules-cairo" ;;
+        alt:dialog)   echo "dialog" ;;
+        alt:dict-ru)  echo "/usr/share/hunspell/ru_RU.dic hunspell-ru" ;;
+        alt:dict-en)  echo "/usr/share/hunspell/en_US.dic hunspell-en" ;;
+
+        debian:evdev)   echo "python3-evdev" ;;
+        debian:xlib)    echo "python3-xlib" ;;
+        debian:gi)      echo "python3-gi" ;;
+        debian:gtk3)    echo "gir1.2-gtk-3.0" ;;
+        debian:appind)  echo "gir1.2-ayatanaappindicator3-0.1 gir1.2-appindicator3-0.1" ;;
+        debian:lshell)  echo "gir1.2-gtklayershell-0.1 libgtk-layer-shell0" ;;
+        debian:vte)     echo "gir1.2-vte-2.91" ;;
+        debian:cairo)   echo "python3-gi-cairo python3-cairo" ;;
+        debian:dialog)  echo "dialog" ;;
+        debian:dict-ru) echo "hunspell-ru" ;;
+        debian:dict-en) echo "hunspell-en-us" ;;
+
+        fedora:evdev)   echo "python3-evdev" ;;
+        fedora:xlib)    echo "python3-xlib" ;;
+        fedora:gi)      echo "python3-gobject" ;;
+        fedora:gtk3)    echo "gtk3" ;;
+        fedora:appind)  echo "libayatana-appindicator-gtk3" ;;
+        fedora:lshell)  echo "gtk-layer-shell" ;;
+        fedora:vte)     echo "vte291-gtk3" ;;
+        fedora:cairo)   echo "python3-gobject python3-cairo" ;;
+        fedora:dialog)  echo "dialog" ;;
+        fedora:dict-ru) echo "hunspell-ru" ;;
+        fedora:dict-en) echo "hunspell-en-US" ;;
+
+        arch:evdev)   echo "python-evdev" ;;
+        arch:xlib)    echo "python-xlib" ;;
+        arch:gi)      echo "python-gobject" ;;
+        arch:gtk3)    echo "gtk3" ;;
+        arch:appind)  echo "libayatana-appindicator" ;;
+        arch:lshell)  echo "gtk-layer-shell" ;;
+        arch:vte)     echo "vte3" ;;
+        arch:cairo)   echo "python-cairo" ;;
+        arch:dialog)  echo "dialog" ;;
+        arch:dict-ru) echo "hunspell-ru" ;;
+        arch:dict-en) echo "hunspell-en_US" ;;
+
+        suse:evdev)   echo "python3-evdev" ;;
+        suse:xlib)    echo "python3-python-xlib" ;;
+        suse:gi)      echo "python3-gobject" ;;
+        suse:gtk3)    echo "typelib-1_0-Gtk-3_0" ;;
+        suse:appind)  echo "typelib-1_0-AyatanaAppIndicator3-0_1" ;;
+        suse:lshell)  echo "typelib-1_0-GtkLayerShell-0_1 gtk-layer-shell" ;;
+        suse:vte)     echo "typelib-1_0-Vte-2_91" ;;
+        suse:cairo)   echo "python3-gobject-cairo python3-cairo" ;;
+        suse:dialog)  echo "dialog" ;;
+        suse:dict-ru) echo "myspell-ru_RU" ;;
+        suse:dict-en) echo "myspell-en_US" ;;
+
+        *) echo "" ;;
+    esac
+}
+
+dep_human() {
+    case "$1" in
+        evdev)   t dh_evdev ;;
+        xlib)    t dh_xlib ;;
+        gi)      t dh_gi ;;
+        gtk3)    t dh_gtk3 ;;
+        appind)  t dh_appind ;;
+        lshell)  t dh_lshell ;;
+        vte)     t dh_vte ;;
+        cairo)   t dh_cairo ;;
+        dialog)  t dh_dialog ;;
+        dict-ru) t dh_dictru ;;
+        dict-en) t dh_dicten ;;
+    esac
+}
+
+# Если ни одно известное имя не подошло — спрашиваем сам репозиторий.
+# Имена пакетов со словарями в дистрибутивах разные и меняются, а поиск
+# по репозиторию находит их независимо от того, как их назвали.
+dep_search() {
+    local dep="$1" pat found=""
+    case "$dep" in
+        dict-ru) pat='ru' ;;
+        dict-en) pat='en' ;;
+        # Имена пакетов с привязкой cairo к Python в дистрибутивах разные
+        # и меняются. Если ни одно известное не подошло — спрашиваем
+        # сам репозиторий, как и для словарей.
+        cairo)
+            case "$DISTRO" in
+                alt|debian)
+                    apt-cache search cairo 2>/dev/null | awk '{print $1}' \
+                        | grep -E '^python3?-(module-)?(gi-)?(py)?cairo$' \
+                        | head -6
+                    ;;
+                fedora)
+                    dnf -q search cairo 2>/dev/null \
+                        | awk -F. '/^python3-.*cairo/{print $1}' | head -6
+                    ;;
+                arch)
+                    pacman -Ssq cairo 2>/dev/null \
+                        | grep -E '^python-?cairo' | head -6
+                    ;;
+                suse)
+                    zypper --quiet search cairo 2>/dev/null \
+                        | awk -F'|' '/python3.*cairo/{gsub(/ /,"",$2); print $2}' \
+                        | head -6
+                    ;;
+            esac
+            return 0
+            ;;
+        *)       return 0 ;;
+    esac
+    case "$DISTRO" in
+        alt|debian)
+            found="$(apt-cache search hunspell 2>/dev/null | awk '{print $1}')"
+            found="$found $(apt-cache search myspell 2>/dev/null | awk '{print $1}')"
+            ;;
+        fedora)
+            found="$(dnf -q search hunspell 2>/dev/null | awk -F. '/^hunspell/{print $1}')"
+            ;;
+        arch)
+            found="$(pacman -Ssq hunspell 2>/dev/null)"
+            ;;
+        suse)
+            found="$(zypper --quiet search myspell 2>/dev/null | awk -F'|' '/^ *i?[ +] *\|/{gsub(/ /,"",$2); print $2}')"
+            ;;
+    esac
+    # отбираем имена, где язык стоит отдельным куском: hunspell-ru,
+    # hunspell-ru-lebedev, myspell-ru_RU. Проверка в два шага, чтобы
+    # не поймать hunspell-ruby: там после "ru" идёт буква, а не разделитель.
+    echo "$found" \
+        | tr ' ' '\n' \
+        | grep -E '^(hunspell|myspell)-' \
+        | grep -E "[-_]${pat}([-_]|\$)" \
+        | head -8
+}
+
+UPDATED=0
+ensure_dep() {
+    local dep="$1" optional="${2:-no}" cand ok=1
+    if have_dep "$dep"; then
+        tf dep_have "$(dep_human "$dep")"
+        return 0
+    fi
+    if [ "$UPDATED" -eq 0 ]; then
+        pm_update
+        UPDATED=1
+    fi
+    for cand in $(dep_candidates "$dep") $(dep_search "$dep"); do
+        if pm_install "$cand"; then
+            if have_dep "$dep"; then
+                tf dep_inst "$(dep_human "$dep")" "$cand"
+                ok=0
+                break
+            fi
+        fi
+    done
+    if [ "$ok" -ne 0 ]; then
+        if [ "$optional" = optional ]; then
+            tf dep_skip "$(dep_human "$dep")"
+            return 0
+        fi
+        tf dep_nfail "$(dep_human "$dep")"
+        tf dep_tried "$(dep_candidates "$dep") $(dep_search "$dep")"
+        return 1
+    fi
+    return 0
+}
+
+# Нужен ли AppIndicator. Индикатор умеет два способа показа значка:
+# Gtk.StatusIcon поверх XEmbed-трея и AppIndicator поверх протокола
+# StatusNotifierItem. XEmbed есть не везде: KDE Plasma 6 его убрала, а
+# wlroots-композиторы не имели никогда. Там без AppIndicator значка
+# не будет вовсе, поэтому на таких системах он обязателен.
+need_appindicator() {
+    command -v kwin_wayland >/dev/null 2>&1 && return 0
+    command -v plasmashell  >/dev/null 2>&1 && return 0
+    command -v sway         >/dev/null 2>&1 && return 0
+    command -v Hyprland     >/dev/null 2>&1 && return 0
+    local d="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
+    case "${d,,}" in
+        *kde*|*plasma*|*sway*|*hyprland*) return 0 ;;
+    esac
+    return 1
+}
+
+# Нужен ли gtk-layer-shell. Меню индикатора рисуется силами GTK, а на
+# Wayland всплывающему окну нужен родитель — обычное окно на экране.
+# Окно-якорь для этого есть, но координаты себе оно не выбирает:
+# композитор ставит его по-своему, а wlroots ещё и берёт в раскладку,
+# сдвигая соседние окна. Layer-shell делает якорь слоевой поверхностью:
+# в раскладку не попадает, отступы задаются — меню встаёт под значком.
+# На GNOME и KDE своя механика, там библиотека не нужна.
+need_layershell() {
+    command -v sway         >/dev/null 2>&1 && return 0
+    command -v Hyprland     >/dev/null 2>&1 && return 0
+    command -v river        >/dev/null 2>&1 && return 0
+    command -v wayfire      >/dev/null 2>&1 && return 0
+    local d="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
+    case "${d,,}" in
+        *sway*|*hyprland*|*river*|*wayfire*|*niri*) return 0 ;;
+    esac
+    return 1
+}
+
+# Есть ли вообще графическая сессия. На сервере без графики индикатор
+# показывать негде, и тянуть ради него GTK смысла нет.
+has_graphics() {
+    [ -d /usr/share/xsessions ] && return 0
+    [ -d /usr/share/wayland-sessions ] && return 0
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && return 0
+    return 1
+}
+
+# --- 1. зависимости ---
+# Здесь временно снимаем errexit/pipefail: подбор пакетов перебирает
+# кандидатов и опрашивает репозитории (apt-cache search и т.п.), а эти
+# команды штатно возвращают ненулевой код (пакет не найден, пусто в
+# пайпе). При `set -e` это обрывало установщик «на 3-й зависимости».
+# Все реальные сбои и так учитываются через FAILED — строгий режим тут
+# только мешает. После блока строгость возвращаем.
+set +e +o pipefail
+echo "$(t s1)"
+FAILED=""
+for d in evdev xlib dialog dict-ru dict-en; do
+    ensure_dep "$d" || FAILED="$FAILED $d"
+done
+
+# Индикатор — часть программы, а не довесок. Если графическая сессия
+# есть, его зависимости обязательны: молча поставить autoswitch без
+# значка в трее хуже, чем честно остановиться и сказать, чего не хватает.
+if has_graphics; then
+    for d in gi gtk3; do
+        ensure_dep "$d" || FAILED="$FAILED $d"
+    done
+    if need_appindicator; then
+        echo "$(t dep_appind_req)"
+        ensure_dep appind || FAILED="$FAILED appind"
+    else
+        # здесь работает Gtk.StatusIcon, AppIndicator лишь про запас
+        ensure_dep appind optional || true
+    fi
+    if need_layershell; then
+        echo "$(t dep_lshell_req)"
+        ensure_dep lshell || FAILED="$FAILED lshell"
+    fi
+    # Своё окно для меню asc. Необязательно: не встало — asc откроется
+    # в системном терминале, как раньше.
+    ensure_dep vte optional || true
+    # Снимок плитки под курсором при перетаскивании. Без pycairo GTK не
+    # принимает поверхность, и вместо плитки едет значок программы —
+    # работать не мешает, поэтому зависимость необязательная.
+    ensure_dep cairo optional || true
+else
+    echo "$(t dep_nogfx)"
+fi
+# вернуть строгий режим для остальной установки
+set -e -o pipefail
+
+if [ -n "$FAILED" ]; then
+    echo
+    echo "$(t dep_fail_hdr)$FAILED"
+    echo "$(t dep_fail_tip)"
+    exit 1
+fi
+
+# --- 1b. словари на ожидаемом месте ---
+# Движок обращается по фиксированному пути. Если дистрибутив положил
+# словарь в другое место, ставим туда символьную ссылку.
+link_dic() {
+    local lang="$1" src dst="/usr/share/hunspell/$1.dic"
+    src="$(find_dic "$lang")" || return 1
+    [ "$src" = "$dst" ] && return 0
+    mkdir -p /usr/share/hunspell
+    ln -sf "$src" "$dst"
+    # рядом лежит .aff — он тоже нужен hunspell-совместимым читалкам
+    local asrc="${src%.dic}.aff"
+    [ -f "$asrc" ] && ln -sf "$asrc" "/usr/share/hunspell/$lang.aff"
+    tf link "$dst" "$src"
+}
+link_dic ru_RU || true
+link_dic en_US || true
+
+# --- 2. модуль uinput ---
+echo "$(t s2)"
+modprobe uinput 2>/dev/null || true
+mkdir -p /etc/modules-load.d
+echo "uinput" > /etc/modules-load.d/autoswitch-uinput.conf
+
+# --- 3. файлы движка ---
+echo "$(t s3)"
+mkdir -p "$LIBDIR" "$CFGDIR"
+install -m 644 "$SRC/autoswitch.py"   "$LIBDIR/autoswitch.py"
+install -m 644 "$SRC/dictionaries.py" "$LIBDIR/dictionaries.py"
+install -m 644 "$SRC/tech_words.py"   "$LIBDIR/tech_words.py"
+install -m 644 "$SRC/config_template.py" "$LIBDIR/config_template.py"
+install -m 644 "$SRC/layout.py"       "$LIBDIR/layout.py"
+# руководство: один текст на консоль и на окно, лежит рядом с движком
+for _m in ru en; do
+    [ -f "$SRC/manual_$_m.txt" ] && \
+        install -m 644 "$SRC/manual_$_m.txt" "$LIBDIR/manual_$_m.txt"
+done
+
+# Папка журнала — рядом с исходниками, в домашнем каталоге пользователя:
+# так лог видно и можно открыть, скопировать или удалить без sudo.
+# Служба работает от root, но владельцем файла делаем пользователя.
+_lu="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+_lh="$(getent passwd "$_lu" | cut -d: -f6)"
+if [ -n "$_lh" ] && [ "$_lu" != root ]; then
+    _ld="$_lh/Applications/autoswitch.logs"
+    mkdir -p "$_ld" 2>/dev/null || true
+    touch "$_ld/autoswitch.log" 2>/dev/null || true
+    chown -R "$_lu:" "$_ld" 2>/dev/null || true
+    chmod 640 "$_ld/autoswitch.log" 2>/dev/null || true
+fi
+install -m 755 "$SRC/asc"             "$BINDIR/asc"
+install -m 755 "$SRC/asc-gui"         "$BINDIR/asc-gui"
+install -m 755 "$SRC/asc-helper"      "$BINDIR/asc-helper"
+# polkit action: разрешает asc-helper без пароля активному локальному
+# пользователю (правка конфига/словаря из GUI без ввода пароля каждый раз)
+if [ -f "$SRC/org.autoswitch.helper.policy" ] && [ -d /usr/share/polkit-1 ]; then
+    mkdir -p "$POLKITACTDIR"
+    install -m 644 "$SRC/org.autoswitch.helper.policy" \
+        "$POLKITACTDIR/org.autoswitch.helper.policy"
+fi
+# Конфиг генерируем из единого двуязычного шаблона (config_template.py) на
+# языке установки. Если конфиг уже был (обновление) — сохраняем значения
+# пользователя, но перевыпускаем комментарии и структуру: так добавляются
+# новые ключи и уходят устаревшие (switch_hotkey, priority_layout) без
+# ручного sed по каждому. Значения ui_lang и прочие берутся из старого.
+GEN="$LIBDIR/config_template.py"
+# Язык конфига и интерфейса = язык, выбранный СЕЙЧАС в установщике. При
+# установке поверх старого — перебиваем: выбрал английский в установщике,
+# значит и конфиг, и меню на английском, независимо от прежнего выбора.
+if [ -f "$CFGDIR/config" ]; then
+    python3 "$GEN" render "$UILANG" "$CFGDIR/config" > "$CFGDIR/config.new" \
+        && mv -f "$CFGDIR/config.new" "$CFGDIR/config"
+else
+    python3 "$GEN" render "$UILANG" > "$CFGDIR/config"
+fi
+chmod 644 "$CFGDIR/config"
+# ui_lang = язык установки, чтобы меню asc/индикатор были на нём, а не
+# падали на автоопределение по системной локали.
+if grep -qE '^ui_lang=' "$CFGDIR/config" 2>/dev/null; then
+    sed -i "s#^ui_lang=.*#ui_lang=${UILANG}#" "$CFGDIR/config"
+else
+    printf 'ui_lang=%s\n' "$UILANG" >> "$CFGDIR/config"
+fi
+[ -f "$CFGDIR/user_words.txt" ] || \
+    echo "# autoswitch user words (one per line)" > "$CFGDIR/user_words.txt"
+
+# «Мой словарь»: learned.txt (US-форма<TAB>ru|us). Заменяет старый
+# user_words.txt как пользовательский источник исключений. Создаём файл и
+# один раз переносим накопленные user_words (они означали «считать
+# английским» → язык us).
+if [ ! -f "$CFGDIR/learned.txt" ]; then
+    {
+        echo "# autoswitch: мой словарь (US-форма<TAB>ru|us)."
+        echo "# Пополняется автоматически при отмене исправлений и вручную."
+        if [ -f "$CFGDIR/user_words.txt" ]; then
+            # grep -v при НУЛЕ строк на выходе (в user_words.txt только
+            # комментарии — как на чистой установке) возвращает код 1.
+            # В пайпе под `set -e -o pipefail` это РОНЯЛО установщик на
+            # шаге [3/9] — и всегда на чистой системе (файл только что создан
+            # пустым), а со второго раза learned.txt уже был и весь блок
+            # пропускался. Глушим код grep через `|| true`.
+            { grep -vE '^[[:space:]]*(#|$)' "$CFGDIR/user_words.txt" \
+                2>/dev/null || true; } \
+                | while IFS= read -r w; do
+                    w="$(printf '%s' "$w" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+                    [ -n "$w" ] && printf '%s\tus\n' "$w"
+                done
+        fi
+    } > "$CFGDIR/learned.txt"
+    chmod 644 "$CFGDIR/learned.txt"
+    # Подсчёт перенесённых слов. grep -c при нуле совпадений тоже даёт код 1;
+    # глушим и гарантируем, что migrated — всегда число.
+    migrated="$(grep -cvE '^[[:space:]]*(#|$)' "$CFGDIR/learned.txt" 2>/dev/null)" || migrated=0
+    [ -z "$migrated" ] && migrated=0
+    if [ "$migrated" -gt 0 ] 2>/dev/null; then
+        tf migrated "$migrated"
+    fi
+fi
+
+# --- готовый файл настроек: применяем ---
+# Файл найден ещё до выбора языка (см. find_preset выше). Применяем его
+# ТОЛЬКО сейчас, когда конфиг и словарь уже созданы: настройки из файла
+# кладутся поверх свежих, словарь сливается — свои слова остаются,
+# принесённые добавляются и при совпадении перекрывают.
+if [ -n "$PRESET" ]; then
+    tf preset_found "$(basename "$PRESET")"
+    [ -n "$PRESET_LANG" ] && tf preset_lang "$UILANG"
+    _pc="$(mktemp)"; _pl="$(mktemp)"
+    awk '/^\[config\]$/  { s = "c"; next }
+         /^\[learned\]$/ { s = "l"; next }
+         s == "c" { print > C }
+         s == "l" { print > L }' C="$_pc" L="$_pl" "$PRESET"
+    # Настройки не копируем как есть, а прогоняем через шаблон: значения
+    # берутся из файла, а ключи, появившиеся в новых версиях, добавляются
+    # со значениями по умолчанию, и пояснения встают на языке установки.
+    if [ -s "$_pc" ]; then
+        if python3 "$GEN" render "$UILANG" "$_pc" > "$CFGDIR/config.new" 2>/dev/null; then
+            mv -f "$CFGDIR/config.new" "$CFGDIR/config"
+        else
+            rm -f "$CFGDIR/config.new"
+            cp -f "$_pc" "$CFGDIR/config"
+        fi
+        chmod 644 "$CFGDIR/config"
+        # ui_lang мог прийти пустым — ставим тот, с которым идёт установка
+        if grep -qE '^ui_lang=' "$CFGDIR/config" 2>/dev/null; then
+            sed -i "s#^ui_lang=.*#ui_lang=${UILANG}#" "$CFGDIR/config"
+        else
+            printf 'ui_lang=%s\n' "$UILANG" >> "$CFGDIR/config"
+        fi
+        echo "$(t preset_cfg)"
+    fi
+    _added="$(python3 - "$CFGDIR/learned.txt" "$_pl" <<'PYEOF'
+import sys
+
+dst, inc = sys.argv[1], sys.argv[2]
+
+
+def read(path):
+    words, head = {}, []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('#'):
+                    head.append(line)
+                    continue
+                if not line:
+                    continue
+                parts = line.replace('\t', ' ').split()
+                if not parts:
+                    continue
+                lang = parts[1].lower() if len(parts) > 1 else 'us'
+                words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
+    except OSError:
+        pass
+    return words, head
+
+
+cur, head = read(dst)
+new, _ = read(inc)
+added = sum(1 for w in new if w not in cur)
+cur.update(new)
+if not head:
+    head = ['# autoswitch: мой словарь (US-форма<TAB>ru|us).']
+try:
+    with open(dst, 'w', encoding='utf-8') as f:
+        for line in head:
+            f.write(line + '\n')
+        for word in sorted(cur):
+            f.write('%s\t%s\n' % (word, cur[word]))
+except OSError:
+    added = 0
+print(added)
+PYEOF
+)" || _added=0
+    [ -z "$_added" ] && _added=0
+    chmod 644 "$CFGDIR/learned.txt" 2>/dev/null || true
+    if [ "$_added" -gt 0 ] 2>/dev/null; then
+        tf preset_words "$_added"
+    fi
+    rm -f "$_pc" "$_pl"
+fi
+
+# --- 4. ярлык и иконка ---
+echo "$(t s4)"
+mkdir -p "$APPDIR" "$ICONDIR"
+install -m 644 "$SRC/autoswitch.desktop" "$APPDIR/autoswitch.desktop"
+# Иконка ставится ТОЛЬКО растровыми PNG во все размеры hicolor.
+# SVG намеренно не устанавливаем: наш autoswitch.svg — это растр внутри
+# SVG-обёртки (не настоящий вектор), и GNOME при масштабировании такого
+# SVG мылит зубцы. Готовые PNG (LANCZOS из оригинала 2048) чётче на всех
+# размерах, и система выбирает ближайший сама.
+for _sz in 16 22 24 32 48 64 96 128 192 256 512; do
+    _dir="/usr/share/icons/hicolor/${_sz}x${_sz}/apps"
+    _png="$SRC/icons/autoswitch_${_sz}.png"
+    if [ -f "$_png" ]; then
+        mkdir -p "$_dir"
+        install -m 644 "$_png" "$_dir/autoswitch.png"
+    fi
+    # отдельная иконка окна настроек индикатора: та же плитка и шестерёнка,
+    # но с камнем вместо букв — чтобы окна различались в панели задач
+    _png2="$SRC/icons/autoswitch-indicator_${_sz}.png"
+    if [ -f "$_png2" ]; then
+        mkdir -p "$_dir"
+        install -m 644 "$_png2" "$_dir/autoswitch-indicator.png"
+    fi
+done
+# подчистим ранее установленный растровый SVG, если он остался от прошлых версий
+rm -f "$ICONDIR/autoswitch.svg" 2>/dev/null || true
+
+# --- 5. индикатор в трее ---
+# На GNOME его заменяет расширение оболочки (в .desktop стоит
+# NotShowIn=GNOME), на Plasma — апплет панели. Ставить GTK-индикатор
+# рядом с ними нельзя: в трее окажется два значка сразу.
+echo "$(t s5)"
+
+have_plasma() {
+    command -v plasmashell >/dev/null 2>&1 || command -v kwin_wayland >/dev/null 2>&1
+}
+
+# Апплет панели ставится в профиль пользователя (~/.local/share/plasma),
+# а установщик работает от root. Поэтому запускаем его установку от имени
+# того, кто вызвал sudo, и подкладываем переменные сессии: без них
+# kpackagetool6 не найдёт профиль, а добавление значка в лоток не сможет
+# достучаться до шины D-Bus.
+run_as_user() {
+    local u uid
+    u="${SUDO_USER:-}"
+    [ -n "$u" ] && [ "$u" != root ] || return 1
+    uid="$(id -u "$u" 2>/dev/null)" || return 1
+    [ -n "$uid" ] || return 1
+
+    local -a envv
+    envv=(
+        "HOME=$(getent passwd "$u" | cut -d: -f6)"
+        "USER=$u"
+        "XDG_RUNTIME_DIR=/run/user/$uid"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+    )
+
+    # Без адреса дисплея запущенная отсюда программа видит другую сессию,
+    # чем та, в которой сидит пользователь: GTK не получает от портала ни
+    # темы, ни настроек, и индикатор, поднятый установщиком, выглядел
+    # иначе, чем запущенный вручную — светлым меню при тёмной системе.
+    # Имя сокета Wayland берём из runtime-каталога: оно не всегда
+    # wayland-0, у Hyprland часто wayland-1.
+    local sock
+    for sock in /run/user/"$uid"/wayland-*; do
+        case "$sock" in *.lock) continue ;; esac
+        [ -S "$sock" ] || continue
+        envv+=("WAYLAND_DISPLAY=${sock##*/}")
+        break
+    done
+    [ -n "${DISPLAY:-}" ] && envv+=("DISPLAY=$DISPLAY")
+    [ -n "${XDG_CURRENT_DESKTOP:-}" ] && \
+        envv+=("XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
+    [ -n "${XDG_SESSION_TYPE:-}" ] && \
+        envv+=("XDG_SESSION_TYPE=$XDG_SESSION_TYPE")
+
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$u" -- env "${envv[@]}" "$@"
+    else
+        sudo -u "$u" env "${envv[@]}" "$@"
+    fi
+}
+
+# Каталог апплета может лежать рядом под разными именами: внутри общей
+# сборки это plasmoid/, а при отдельной распаковке — autoswitch-plasmoid/.
+PLASMOID_DIR=""
+for d in "$SRC/plasmoid" "$SRC/autoswitch-plasmoid" "$SRC/../plasmoid"; do
+    [ -d "$d" ] && { PLASMOID_DIR="$d"; break; }
+done
+
+# Решает именно наличие Plasma, а не наличие каталога апплета: если
+# поставить сюда GTK-индикатор, в трее окажется два значка сразу.
+if have_plasma; then
+    echo "$(t plasma_noind)"
+    # старый GTK-индикатор мог остаться от прежней установки
+    rm -f "$AUTOSTARTDIR/autoswitch-indicator.desktop"
+    rm -f "$APPDIR/autoswitch-indicator.desktop"
+    rm -f "$BINDIR/autoswitch-indicator"
+    pkill -f autoswitch-indicator 2>/dev/null || true
+    # правило polkit нужно и апплету: он тоже дёргает systemctl
+    if [ -f "$SRC/autoswitch-polkit.rules" ] && [ -d /etc/polkit-1 ]; then
+        mkdir -p "$POLKITDIR"
+        install -m 644 "$SRC/autoswitch-polkit.rules" \
+            "$POLKITDIR/49-autoswitch.rules"
+    fi
+    # --- мост активного окна ---
+    # Без него на Plasma Wayland не работают исключения приложений: KWin
+    # знает класс активного окна, но наружу его не отдаёт. Скрипт внутри
+    # KWin толкает класс приёмнику, приёмник хранит, движок спрашивает.
+    if [ -f "$SRC/autoswitch-focus-bridge" ]; then
+        install -m 755 "$SRC/autoswitch-focus-bridge" \
+            "$BINDIR/autoswitch-focus-bridge"
+        if [ -f "$SRC/autoswitch-focus-bridge.desktop" ]; then
+            mkdir -p "$AUTOSTARTDIR"
+            install -m 644 "$SRC/autoswitch-focus-bridge.desktop" \
+                "$AUTOSTARTDIR/autoswitch-focus-bridge.desktop"
+        fi
+
+        KWIN_SRC=""
+        for d in "$SRC/kwin-script/autoswitch" "$SRC/../kwin-script/autoswitch"; do
+            [ -d "$d" ] && { KWIN_SRC="$d"; break; }
+        done
+
+        if [ -n "$KWIN_SRC" ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
+            KWIN_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+            KWIN_DIR="$KWIN_HOME/.local/share/kwin/scripts/autoswitch"
+            rm -rf "$KWIN_DIR"
+            mkdir -p "$(dirname "$KWIN_DIR")"
+            cp -r "$KWIN_SRC" "$KWIN_DIR"
+            chown -R "$SUDO_USER:" "$KWIN_HOME/.local/share/kwin" 2>/dev/null || true
+
+            # KWin читает список включённых скриптов из kwinrc; без этой
+            # записи файл просто лежит и не выполняется
+            if command -v kwriteconfig6 >/dev/null 2>&1; then
+                run_as_user kwriteconfig6 --file kwinrc \
+                    --group Plugins --key autoswitchEnabled true \
+                    >/dev/null 2>&1 || true
+            fi
+            # перечитать настройки, иначе скрипт запустится только со
+            # следующим входом в сессию
+            run_as_user gdbus call --session -d org.kde.KWin -o /KWin \
+                -m org.kde.KWin.reconfigure >/dev/null 2>&1 || true
+            echo "$(t kwin_ok)"
+        fi
+
+        # поднять приёмник прямо сейчас: автозапуск сработает только при
+        # следующем входе в сессию
+        pkill -f autoswitch-focus-bridge 2>/dev/null || true
+        if command -v systemd-run >/dev/null 2>&1; then
+            run_as_user systemd-run --user --quiet \
+                --unit=autoswitch-focus-bridge \
+                "$BINDIR/autoswitch-focus-bridge" >/dev/null 2>&1 || true
+        else
+            run_as_user setsid -f "$BINDIR/autoswitch-focus-bridge" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # ставим апплет сразу, чтобы не заставлять запускать вторую команду
+    if [ -n "$PLASMOID_DIR" ] && [ -x "$PLASMOID_DIR/install-plasmoid" ]; then
+        tf applet_do "${SUDO_USER:-?}"
+        # вывод не глушим: по нему видно, куда апплет реально встал.
+        # Раньше он уходил в /dev/null, и место установки приходилось
+        # угадывать по внешнему виду панели.
+        if run_as_user "$PLASMOID_DIR/install-plasmoid" 2>&1 | sed 's/^/      /'
+        then
+            PLASMOID_HINT=0
+        else
+            echo "$(t applet_auto_fail)"
+            PLASMOID_HINT=1
+        fi
+    else
+        PLASMOID_HINT=1
+    fi
+elif [ -f "$SRC/autoswitch-indicator" ] && has_graphics; then
+    install -m 755 "$SRC/autoswitch-indicator" "$BINDIR/autoswitch-indicator"
+    if [ -f "$SRC/autoswitch-indicator.desktop" ]; then
+        install -m 644 "$SRC/autoswitch-indicator.desktop" \
+            "$APPDIR/autoswitch-indicator.desktop"
+        mkdir -p "$AUTOSTARTDIR"
+        install -m 644 "$SRC/autoswitch-indicator.desktop" \
+            "$AUTOSTARTDIR/autoswitch-indicator.desktop"
+    fi
+    # правило polkit: кнопки Старт/Стоп/Перезапуск без пароля
+    if [ -f "$SRC/autoswitch-polkit.rules" ] && [ -d /etc/polkit-1 ]; then
+        mkdir -p "$POLKITDIR"
+        install -m 644 "$SRC/autoswitch-polkit.rules" \
+            "$POLKITDIR/49-autoswitch.rules"
+    fi
+    # Уже запущенный индикатор держит в памяти прежнюю версию: файл на
+    # диске обновился, а окно настроек и значок остались старыми. Служба
+    # перезапускается сама, а индикатор — нет, поэтому перезапускаем его
+    # здесь, иначе после каждого обновления это пришлось бы делать руками.
+    if pgrep -f autoswitch-indicator >/dev/null 2>&1; then
+        pkill -f autoswitch-indicator 2>/dev/null || true
+        sleep 0.5
+        MSG="$(t ind_restarted)"
+    else
+        MSG="$(t ind_started)"
+    fi
+    # Запускаем в любом случае: раньше значок поднимался только если уже
+    # работал, а после первой установки на живой сессии его приходилось
+    # ждать до перезахода или звать руками.
+    run_as_user setsid -f "$BINDIR/autoswitch-indicator" >/dev/null 2>&1 \
+        || run_as_user "$BINDIR/autoswitch-indicator" >/dev/null 2>&1 &
+    echo "    $MSG"
+elif [ ! -f "$SRC/autoswitch-indicator" ]; then
+    echo "$(t ind_nofile)"
+else
+    echo "$(t ind_nogfx)"
+fi
+
+# --- 6. расширение GNOME Shell ---
+# На Wayland движок не может ни переключить раскладку, ни узнать класс
+# активного окна: это умеет только сама оболочка. Расширение — не
+# украшение, без него autoswitch в GNOME Wayland работать не будет,
+# поэтому ставится вместе со всем остальным, а не отдельной командой.
+echo "$(t s6)"
+
+EXT_UUID="autoswitch@shah-man.github.io"
+EXT_SRC=""
+for d in "$SRC/gnome-extension/$EXT_UUID" "$SRC/../gnome-extension/$EXT_UUID"; do
+    [ -d "$d" ] && { EXT_SRC="$d"; break; }
+done
+
+GNOME_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+GNOME_HOME="$(getent passwd "$GNOME_USER" | cut -d: -f6)"
+
+if ! command -v gnome-shell >/dev/null 2>&1; then
+    echo "$(t gs_notfound)"
+elif [ -z "$EXT_SRC" ]; then
+    echo "$(t ext_nobuild)"
+elif [ -z "$GNOME_HOME" ] || [ "$GNOME_USER" = root ]; then
+    echo "$(t ext_nouser)"
+else
+    EXT_DIR="$GNOME_HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+    if [ -d "$EXT_DIR" ]; then
+        # gschemas.compiled собирается на месте и в сборке его нет,
+        # поэтому в сравнении он не участвует — иначе каталоги отличались
+        # бы всегда и установщик на каждом запуске просил бы перезайти.
+        if diff -rq --exclude=gschemas.compiled "$EXT_SRC" "$EXT_DIR" \
+             >/dev/null 2>&1; then
+            EXT_ACTION="$(t ext_act_same)"
+        else
+            EXT_ACTION="$(t ext_act_updated)"
+        fi
+    else
+        EXT_ACTION="$(t ext_act_installed)"
+    fi
+
+    # копируем целиком, а не поверх: так уходят файлы, удалённые из сборки.
+    # Скомпилированные схемы сохраняем и кладём обратно: пересобирать их
+    # незачем, если сами схемы не менялись.
+    KEEP_COMPILED=""
+    if [ -f "$EXT_DIR/schemas/gschemas.compiled" ]; then
+        KEEP_COMPILED="$(mktemp)"
+        cp "$EXT_DIR/schemas/gschemas.compiled" "$KEEP_COMPILED"
+    fi
+    rm -rf "$EXT_DIR"
+    mkdir -p "$(dirname "$EXT_DIR")"
+    cp -r "$EXT_SRC" "$EXT_DIR"
+
+    # схемы настроек нужны в скомпилированном виде, иначе окно настроек
+    # расширения падает при открытии
+    if [ -d "$EXT_DIR/schemas" ]; then
+        if [ -n "$KEEP_COMPILED" ] && [ "$EXT_ACTION" = "уже стоит и совпадает с этой сборкой" ]; then
+            install -m 644 "$KEEP_COMPILED" "$EXT_DIR/schemas/gschemas.compiled"
+        elif command -v glib-compile-schemas >/dev/null 2>&1; then
+            if ! glib-compile-schemas "$EXT_DIR/schemas"; then
+                echo "$(t schema_warn1)"
+                echo "$(t schema_warn2)"
+            fi
+        fi
+    fi
+    [ -n "$KEEP_COMPILED" ] && rm -f "$KEEP_COMPILED"
+
+    # chown строго ПОСЛЕ компиляции схем: установщик работает от root,
+    # и созданный им gschemas.compiled иначе остаётся root:root с umask 077.
+    # Оболочка читает файл от имени пользователя, получает "Отказано в
+    # доступе", enable() падает — и расширения на панели просто нет.
+    chown -R "$GNOME_USER:" "$GNOME_HOME/.local/share/gnome-shell" 2>/dev/null || true
+    if [ -f "$EXT_DIR/schemas/gschemas.compiled" ]; then
+        chmod 644 "$EXT_DIR/schemas/gschemas.compiled"
+    fi
+
+    echo "    $EXT_ACTION"
+
+    if run_as_user gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1; then
+        echo "$(t ext_enabled)"
+    else
+        echo "$(t ext_enable_later)"
+        echo "      gnome-extensions enable $EXT_UUID"
+    fi
+
+    # Оболочка держит код расширения в памяти. На X11 её можно перезапустить
+    # на лету, на Wayland — нет, там нужен перезаход в сессию.
+    if [ "$EXT_ACTION" = "обновлено" ]; then
+        EXT_RELOGIN=1
+    fi
+fi
+
+command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+command -v update-desktop-database >/dev/null 2>&1 && \
+    update-desktop-database "$APPDIR" 2>/dev/null || true
+
+# --- 6. служба systemd ---
+echo "$(t s7)"
+install -m 644 "$SRC/autoswitch.service" /etc/systemd/system/autoswitch.service
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+XAUTH_PATH="${REAL_HOME:-/root}/.Xauthority"
+sed -i "s|__XAUTH__|$XAUTH_PATH|" /etc/systemd/system/autoswitch.service
+systemctl daemon-reload
+
+# --- 7. запуск ---
+echo "$(t s8)"
+systemctl enable autoswitch >/dev/null 2>&1
+systemctl restart autoswitch || true
+
+# --- 9. каталог исходников ---
+# Смысл: на любой машине исходники лежат по одному пути и всегда
+# соответствуют тому, что стоит в системе. Значит переустановиться можно
+# без сети — зайти туда и запустить installasc заново.
+#
+# Копия делается полной, с удалением лишнего: иначе файлы, выброшенные из
+# проекта, оставались бы навсегда, и каталог перестал бы быть копией
+# сборки. Из этого следует правило: обновлять его только целым архивом,
+# частичная распаковка поверх сделает набор неполным.
+echo "$(t s9)"
+
+SRC_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+SRC_HOME="$(getent passwd "$SRC_USER" | cut -d: -f6)"
+KEEP_DIR="${SRC_HOME:-/root}/Applications/autoswitch"
+
+if [ -z "$SRC_HOME" ] || [ "$SRC_USER" = root ]; then
+    echo "$(t src_nohome)"
+elif [ "$SRC" = "$KEEP_DIR" ]; then
+    tf src_here "$KEEP_DIR"
+else
+    if [ -d "$KEEP_DIR" ]; then
+        # одна страховочная копия: откатиться, если новая сборка окажется
+        # хуже старой
+        rm -rf "$KEEP_DIR.bak"
+        mv "$KEEP_DIR" "$KEEP_DIR.bak"
+        tf bak "$KEEP_DIR.bak"
+    fi
+    mkdir -p "$(dirname "$KEEP_DIR")"
+    cp -r "$SRC" "$KEEP_DIR"
+    # Файл настроек, если его положили рядом с установщиком, в постоянную
+    # копию НЕ едет. Иначе при переустановке отсюда через полгода он
+    # нашёлся бы снова и молча вернул настройки полугодовой давности,
+    # затерев нынешние. Свою работу он уже сделал — при этой установке.
+    rm -f "$KEEP_DIR"/autoswitch-settings-*.txt 2>/dev/null || true
+    chown -R "$SRC_USER:" "${SRC_HOME}/Applications" 2>/dev/null || true
+    tf src_laid "$KEEP_DIR"
+fi
+
+echo
+echo "$(t done)"
+echo "$(t help_menu)"
+echo "$(t help_cmds)"
+echo "$(t help_uninstall)"
+if [ -n "${KEEP_DIR:-}" ] && [ -x "$KEEP_DIR/installasc" ]; then
+    tf reinstall "$KEEP_DIR"
+fi
+
+if [ "${EXT_RELOGIN:-0}" = "1" ]; then
+    echo
+    echo "$(t ext_updated1)"
+    echo "$(t ext_updated2)"
+fi
+
+if [ "${PLASMOID_HINT:-0}" = "1" ]; then
+    echo
+    if [ -n "$PLASMOID_DIR" ] && [ -x "$PLASMOID_DIR/install-plasmoid" ]; then
+        echo "$(t plasmoid_todo1)"
+        echo "$(t plasmoid_todo2)"
+        echo "    $PLASMOID_DIR/install-plasmoid"
+    else
+        echo "$(t plasmoid_warn1)"
+        echo "$(t plasmoid_warn2)"
+        echo "$(t plasmoid_warn3)"
+    fi
+fi
+# ─────────────────────────── проверка раскладок ───────────────────────
+# Autoswitch переключает раскладку — значит их должно быть минимум две.
+# С одной он установится и запустится, но переключать будет не на что, и
+# со стороны это выглядит как «поставил, а оно не работает».
+#
+# Единого места, где лежит список раскладок, нет: GNOME держит его в
+# dconf, KDE в kxkbrc, Hyprland и sway в своих конфигах, а системная
+# настройка (localectl) при этом может быть совсем другой — окружения на
+# неё не смотрят. Поэтому опрашиваем все источники сразу, берём
+# НАИБОЛЬШЕЕ найденное число и предупреждаем, только когда все согласны,
+# что раскладка одна. Не выяснили ничего — молчим: напугать зря хуже.
+
+# Число непустых элементов списка через запятую: "us,ru" -> 2
+# Кавычки и пробелы убираем, крайние запятые тоже (в lua-конфиге
+# Hyprland строка заканчивается запятой, иначе она дала бы лишний +1).
+csv_count() {
+    local s
+    s="$(printf '%s' "${1:-}" | tr -d '\042\047 ' | sed 's/^,*//; s/,*$//')"
+    [ -n "$s" ] || { echo 0; return 0; }
+    printf '%s' "$s" | awk -F, '{c=0; for (i=1; i<=NF; i++) if ($i != "") c++; print c}'
+}
+
+layout_count() {
+    local best=0 v n u h
+    u="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+    h="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+    [ -n "$h" ] || h="$HOME"
+
+    # 1. GNOME и всё, что хранит настройку в dconf.
+    #    Значение вида: [('xkb', 'us'), ('xkb', 'ru')] — считаем записи.
+    v="$(run_as_user gsettings get org.gnome.desktop.input-sources sources 2>/dev/null)"
+    n="$(printf '%s' "$v" | grep -o "'[^']*')" | wc -l)"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 2. KDE Plasma: LayoutList=us,ru
+    n="$(csv_count "$(grep -m1 '^LayoutList=' "$h/.config/kxkbrc" 2>/dev/null | cut -d= -f2)")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 3. Hyprland: kb_layout = us,ru — и в старом .conf, и в новом .lua
+    v="$(grep -rhm1 'kb_layout' "$h/.config/hypr" 2>/dev/null | head -1 \
+         | sed 's/.*kb_layout//; s/^[[:space:]]*=//')"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 4. sway: xkb_layout "us,ru"
+    v="$(grep -rhm1 'xkb_layout' "$h/.config/sway" 2>/dev/null | head -1 \
+         | sed 's/.*xkb_layout//')"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 5. живая сессия X11 — XFCE, LXQt и прочие, где своего хранилища нет
+    v="$(run_as_user env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="$h/.Xauthority" \
+         setxkbmap -query 2>/dev/null | awk '/^layout:/{print $2}')"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 6. системная настройка через systemd
+    v="$(localectl status 2>/dev/null | awk -F: '/X11 Layout/{print $2}')"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 7. то же, но прямо из файла — на случай, если localectl недоступен
+    v="$(grep -rhm1 'XkbLayout' /etc/X11/xorg.conf.d 2>/dev/null | head -1 \
+         | sed 's/.*XkbLayout//')"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    # 8. Debian и ALT: /etc/default/keyboard
+    v="$(grep -m1 '^XKBLAYOUT=' /etc/default/keyboard 2>/dev/null | cut -d= -f2)"
+    n="$(csv_count "$v")"
+    if [ "${n:-0}" -gt "$best" ] 2>/dev/null; then best="$n"; fi
+
+    echo "$best"
+}
+
+# Опрос источников штатно возвращает ненулевые коды (файла нет, grep не
+# нашёл, команды может не быть вовсе) — строгий режим тут только мешает,
+# как и в блоке зависимостей. После проверки строгость возвращаем.
+set +e +o pipefail
+KB_N="$(layout_count)"
+set -e -o pipefail
+if [ "${KB_N:-0}" = "1" ]; then
+    echo
+    echo "$(t kb_one1)"
+    echo "$(t kb_one2)"
+    echo "$(t kb_one3)"
+fi
+
+echo
+sleep 1
+echo
+echo "$(t ses_hdr)"
+# Служба пишет эту строку не в первый миг после запуска, а скрипт
+# добирается до журнала почти сразу — поэтому ждём её появления, но
+# недолго: если за пару секунд не написала, отсылаем к журналу.
+ses_line=""
+for _ in 1 2 3 4 5 6 7 8; do
+    # -a обязателен: если в журнал попал хоть один нетекстовый байт,
+    # grep считает весь поток двоичным, строку не отдаёт и ругается в
+    # поток ошибок. Раньше из-за этого цикл прокручивался вхолостую все
+    # восемь раз, печатал восемь одинаковых предупреждений, а вместо
+    # строки сессии показывал запасной текст.
+    ses_line="$(tail -n 40 "${_lh:-$HOME}/Applications/autoswitch.logs/autoswitch.log" \
+                2>/dev/null | grep -a -E 'session=|compositor=' 2>/dev/null | tail -1)"
+    [ -n "$ses_line" ] && break
+    sleep 0.25
+done
+if [ -n "$ses_line" ]; then
+    echo "$ses_line"
+else
+    echo "$(t ses_see)"
+fi

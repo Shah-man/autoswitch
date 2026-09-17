@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# uninstall-plasmoid — удаление апплета Autoswitch из Plasma.
+# Убирает и с панели, и из списков лотка — апплет мог стоять там и там.
+set -uo pipefail
+
+ID="org.shah-man.autoswitch"
+
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Запускать БЕЗ sudo."
+    exit 1
+fi
+
+gdbus call --session -d org.kde.plasmashell -o /PlasmaShell \
+    -m org.kde.PlasmaShell.evaluateScript '
+var id = "org.shah-man.autoswitch";
+var old = "org.kde.plasma.keyboardlayout.autoswitch";
+var ps = panels();
+for (var i = 0; i < ps.length; i++) {
+    var ws = ps[i].widgets();
+    for (var j = 0; j < ws.length; j++) {
+        // с панели
+        if (ws[j].type === id || ws[j].type === old) {
+            try { ws[j].remove(); } catch (e) { }
+        }
+        // из списков лотка
+        if (ws[j].type === "org.kde.plasma.systemtray") {
+            var t = ws[j];
+            t.currentConfigGroup = ["General"];
+            var keys = ["extraItems", "shownItems", "hiddenItems"];
+            for (var n = 0; n < keys.length; n++) {
+                var items = String(t.readConfig(keys[n], "")).split(",")
+                    .filter(function (s) { return s.length > 0 && s !== id && s !== old; });
+                t.writeConfig(keys[n], items.join(","));
+            }
+            t.reloadConfig();
+        }
+    }
+}
+print("ok");' >/dev/null 2>&1 || true
+
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    # апплет мог остаться установленным под прежним идентификатором
+    kpackagetool6 --type Plasma/Applet --remove org.kde.plasma.keyboardlayout.autoswitch >/dev/null 2>&1 || true
+    if kpackagetool6 --type Plasma/Applet --remove "$ID" >/dev/null 2>&1; then
+        echo "Апплет удалён."
+    else
+        echo "Апплет не был установлен."
+    fi
+else
+    echo "Нет kpackagetool6."
+fi
+
+systemctl --user restart plasma-plasmashell 2>/dev/null || true

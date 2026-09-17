@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""autoswitch-focus-bridge — приёмник класса активного окна на Plasma.
+
+Зачем нужен. KWin-скрипт умеет только отправлять сообщения (callDBus без
+ответа) и живёт внутри kwin_wayland. Движок autoswitch работает от root и
+на шину пользователя ходит через sudo -u, то есть ему нужен собеседник,
+который отвечает на запрос. Эта служба и есть такой собеседник: KWin
+толкает ей класс при каждой смене окна, она его запоминает, движок
+спрашивает текущее значение.
+
+Полученный класс служба кладёт в файл $XDG_RUNTIME_DIR/autoswitch-focus.
+Движок читает именно файл, а не спрашивает по D-Bus: он работает от root,
+и каждый запрос в чужую шину means запуск sudo и gdbus — это и дорого, и
+засоряет журнал аутентификации, и отвечает с задержкой. Чтение файла
+стоит ничего и отдаёт значение сразу.
+
+Служба намеренно пустая: ни таймеров, ни опроса, ни обращений к X11 или
+Wayland.
+
+Запускается в сессии пользователя (автозапуск), только на Plasma.
+"""
+
+import os
+import signal
+import sys
+import tempfile
+
+import gi
+
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = 'org.autoswitch.Focus'
+OBJ_PATH = '/Focus'
+IFACE = 'org.autoswitch.Focus'
+
+INTROSPECTION = f"""
+<node>
+  <interface name='{IFACE}'>
+    <method name='SetClass'>
+      <arg type='s' name='cls' direction='in'/>
+    </method>
+    <method name='GetFocusedClass'>
+      <arg type='s' name='cls' direction='out'/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+def _state_path():
+    """Файл, из которого движок читает класс активного окна."""
+    base = os.environ.get('XDG_RUNTIME_DIR') or tempfile.gettempdir()
+    return os.path.join(base, 'autoswitch-focus')
+
+
+class Bridge:
+    def __init__(self):
+        self.cls = ''
+        self.path = _state_path()
+        self.write('')
+
+    def write(self, value):
+        # запись через временный файл и rename: движок никогда не увидит
+        # наполовину записанную строку
+        try:
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                fh.write(value)
+            os.replace(tmp, self.path)
+        except Exception as ex:
+            print(f'[autoswitch-focus-bridge] не записать {self.path}: {ex}',
+                  file=sys.stderr)
+        self.node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        self.conn = None
+
+    # --- обработка вызовов ---
+    def on_call(self, conn, sender, path, iface, method, params, invocation):
+        if method == 'SetClass':
+            value = params.unpack()[0] or ''
+            self.cls = value.strip().lower()
+            self.write(self.cls)
+            invocation.return_value(None)
+        elif method == 'GetFocusedClass':
+            invocation.return_value(GLib.Variant('(s)', (self.cls,)))
+        else:
+            invocation.return_error_literal(
+                Gio.dbus_error_quark(),
+                Gio.DBusError.UNKNOWN_METHOD,
+                f'Unknown method {method}',
+            )
+
+    # --- жизненный цикл имени на шине ---
+    def on_bus_acquired(self, conn, name):
+        self.conn = conn
+        conn.register_object(
+            OBJ_PATH,
+            self.node.interfaces[0],
+            self.on_call,
+            None,
+            None,
+        )
+
+    def on_name_lost(self, conn, name):
+        # Имя перехвачено другим экземпляром — уходим молча, иначе в сессии
+        # окажутся две службы с разными значениями.
+        print('[autoswitch-focus-bridge] имя занято другим экземпляром',
+              file=sys.stderr)
+        sys.exit(0)
+
+
+def main():
+    bridge = Bridge()
+    loop = GLib.MainLoop()
+
+    Gio.bus_own_name(
+        Gio.BusType.SESSION,
+        BUS_NAME,
+        Gio.BusNameOwnerFlags.NONE,
+        bridge.on_bus_acquired,
+        None,
+        bridge.on_name_lost,
+    )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
+                             lambda: (loop.quit(), False)[1])
+
+    loop.run()
+
+
+if __name__ == '__main__':
+    main()

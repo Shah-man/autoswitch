@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# install-plasmoid — установка апплета Autoswitch в Plasma.
+#
+# По умолчанию апплет ставится ВНУТРЬ системного лотка.
+#
+# Порядок значков в лотке задать нечем: ряд рисуется GridView по модели
+# без сортировки, а сама модель складывается в том порядке, в каком
+# апплеты зарегистрировались при старте оболочки. Проверено на живой
+# Plasma 6.6.5 — ни extraItems, ни идентификатор плагина, ни установка
+# в /usr/share вместо ~/.local на порядок не влияют. Свежепоставленный
+# апплет оказывается последним среди видимых.
+#
+# Поэтому значок встаёт справа, у стрелки. Вплотную к раскладке он
+# окажется, только если скрыть значки, стоящие между ними, — это выбор
+# пользователя, установщик чужие значки не трогает.
+#
+# В shownItems апплет НЕ прописывается: принудительный показ перебивает
+# собственный статус апплета, и тогда флаг show_indicator в
+# /etc/autoswitch/config перестаёт его прятать.
+#
+# Запасной режим — на панель слева от лотка: AUTOSWITCH_PLACE=panel
+set -euo pipefail
+
+ID="org.shah-man.autoswitch"
+OLD_ID="org.kde.plasma.keyboardlayout.autoswitch"
+# Имя исходного каталога прежнее: kpackagetool6 берёт идентификатор из
+# metadata.json, а ставит апплет в ~/.local/share/plasma/plasmoids/<Id>.
+SRC="$(cd "$(dirname "$0")" && pwd)/org.shah-man.autoswitch"
+PLACE="${AUTOSWITCH_PLACE:-tray}"
+
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Запускать БЕЗ sudo: апплет ставится в профиль пользователя."
+    exit 1
+fi
+
+[ -d "$SRC" ] || { echo "Не найден каталог апплета: $SRC"; exit 1; }
+command -v kpackagetool6 >/dev/null 2>&1 || { echo "Нет kpackagetool6 — это не Plasma 6?"; exit 1; }
+
+run_script() {
+    gdbus call --session \
+        -d org.kde.plasmashell -o /PlasmaShell \
+        -m org.kde.PlasmaShell.evaluateScript "$1" 2>/dev/null
+}
+
+# --- 0. убрать апплет под старым идентификатором ---
+if kpackagetool6 --type Plasma/Applet --list 2>/dev/null | grep -qx "$OLD_ID"; then
+    echo "Убираю апплет со старым идентификатором..."
+    kpackagetool6 --type Plasma/Applet --remove "$OLD_ID" >/dev/null 2>&1 || true
+fi
+
+# --- 1. сам пакет ---
+if kpackagetool6 --type Plasma/Applet --list 2>/dev/null | grep -qx "$ID"; then
+    echo "Апплет уже установлен, обновляю..."
+    kpackagetool6 --type Plasma/Applet --upgrade "$SRC" >/dev/null
+else
+    echo "Устанавливаю апплет..."
+    kpackagetool6 --type Plasma/Applet --install "$SRC" >/dev/null
+fi
+echo "  пакет: готово"
+
+# --- 2а. внутрь лотка, вплотную к раскладке ---
+place_in_tray() {
+    run_script '
+var id = "org.shah-man.autoswitch";
+var old = "org.kde.plasma.keyboardlayout.autoswitch";
+var result = "no-tray";
+var ps = panels();
+for (var i = 0; i < ps.length; i++) {
+    var ws = ps[i].widgets();
+    for (var j = 0; j < ws.length; j++) {
+        var w = ws[j];
+        // old instance may still sit on the panel: that is the duplicate icon
+        if (w.type === id || w.type === old) {
+            try { w.remove(); } catch (e) { }
+            continue;
+        }
+        if (w.type !== "org.kde.plasma.systemtray") { continue; }
+        w.currentConfigGroup = ["General"];
+        var keys = ["extraItems"];
+        for (var n = 0; n < keys.length; n++) {
+            var items = String(w.readConfig(keys[n], "")).split(",")
+                .filter(function (s) { return s.length > 0 && s !== old; });
+            if (items.indexOf(id) === -1) { items.push(id); }
+            w.writeConfig(keys[n], items.join(","));
+        }
+        var hidden = String(w.readConfig("hiddenItems", "")).split(",")
+            .filter(function (s) { return s.length > 0 && s !== id && s !== old; });
+        w.writeConfig("hiddenItems", hidden.join(","));
+        w.reloadConfig();
+        result = "ok";
+    }
+}
+print(result);'
+}
+
+# --- 2б. запасной путь: на панель слева от лотка ---
+place_on_panel() {
+    run_script '
+var id = "org.shah-man.autoswitch";
+var old = "org.kde.plasma.keyboardlayout.autoswitch";
+var result = "no-panel";
+var ps = panels();
+for (var i = 0; i < ps.length; i++) {
+    var p = ps[i];
+    var ws = p.widgets();
+    var tray = null, mine = null;
+    for (var k = 0; k < ws.length; k++) {
+        if (ws[k].type === "org.kde.plasma.systemtray") { tray = ws[k]; }
+        if (ws[k].type === id) { mine = ws[k]; }
+        if (ws[k].type === old) { try { ws[k].remove(); } catch (e) { } }
+    }
+    if (tray === null) { continue; }
+
+    // drop ourselves from the tray lists, otherwise there are two icons
+    tray.currentConfigGroup = ["General"];
+    var keys = ["extraItems", "shownItems", "hiddenItems"];
+    for (var n = 0; n < keys.length; n++) {
+        var items = String(tray.readConfig(keys[n], "")).split(",")
+            .filter(function (s) { return s.length > 0 && s !== id && s !== old; });
+        tray.writeConfig(keys[n], items.join(","));
+    }
+    tray.reloadConfig();
+
+    if (mine === null) { mine = p.addWidget(id); result = "ok"; }
+    else { result = "already"; }
+
+    // AppletOrder in the panel config holds applet ids separated by ';'
+    // and defines the order. Widget.index does nothing in Plasma 6.
+    p.currentConfigGroup = ["General"];
+    var raw = String(p.readConfig("AppletOrder", ""));
+    var order = raw.split(";").filter(function (s) { return s.length > 0; });
+    var myId = String(mine.id);
+    var trayId = String(tray.id);
+    if (order.length === 0) {
+        for (var m = 0; m < ws.length; m++) { order.push(String(ws[m].id)); }
+    }
+    order = order.filter(function (s) { return s !== myId; });
+    var ti = order.indexOf(trayId);
+    if (ti === -1) { order.push(myId); } else { order.splice(ti, 0, myId); }
+    p.writeConfig("AppletOrder", order.join(";"));
+    p.reloadConfig();
+    break;
+}
+print(result);'
+}
+
+if [ "$PLACE" = panel ]; then
+    echo "Добавляю на панель слева от лотка..."
+    out="$(place_on_panel || true)"
+else
+    echo "Добавляю в системный лоток рядом с раскладкой..."
+    out="$(place_in_tray || true)"
+fi
+
+case "${out:-}" in
+    *already*) echo "  апплет уже на месте" ;;
+    *ok*)      echo "  готово" ;;
+    *)
+        echo "  автоматически не вышло"
+        echo "  добавьте вручную: правый клик по лотку → «Настроить системный лоток…»"
+        ;;
+esac
+
+# --- 3. перечитать оболочку ---
+echo "Перезапускаю оболочку..."
+systemctl --user restart plasma-plasmashell 2>/dev/null \
+    || echo "  перезапустите вручную: systemctl --user restart plasma-plasmashell"
+
+echo
+echo "== Готово =="
+if [ "$PLACE" != panel ]; then
+    echo "Апплет стоит в лотке, последним среди видимых значков."
+    echo "Порядок внутри лотка Plasma не даёт задать; чтобы значок оказался"
+    echo "вплотную к раскладке, скройте значки, стоящие между ними:"
+    echo "  стрелка ^ -> кнопка настроек -> Записи -> Скрыто."
+    echo
+    echo "Ширину меню тоже задаёт лоток, апплет её не уменьшает."
+    echo "Компактное меню — только на панели: AUTOSWITCH_PLACE=panel $0"
+fi

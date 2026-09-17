@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Autoswitch
+GenericName=Keyboard Layout Switcher
+GenericName[ru]=Переключатель раскладки
+Comment=Automatic keyboard layout switcher (asc)
+Comment[ru]=Автоматический переключатель раскладки (asc)
+Exec=asc-gui
+Icon=autoswitch
+Terminal=false
+Categories=Settings;System;Utility;
+Keywords=autoswitch;asc;keyboard;layout;switch;language;раскладка;переключатель;
+# по этому имени панель связывает открытое окно с ярлыком
+StartupWMClass=autoswitch

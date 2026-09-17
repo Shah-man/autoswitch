@@ -1,0 +1,13 @@
+# сборочный архив и контрольные суммы
+autoswitch.tar.gz
+*.tar.gz
+*.sha256
+
+# экспорт настроек — в репозитории ему не место
+autoswitch-settings-*.txt
+
+# мусор python и редакторов
+__pycache__/
+*.pyc
+*~
+.*.swp

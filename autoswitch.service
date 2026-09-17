@@ -1,0 +1,45 @@
+[Unit]
+Description=autoswitch — automatic keyboard layout switcher
+Documentation=https://github.com/Shah-man/autoswitch
+# Порядок задаём по менеджеру входа, а НЕ через After=graphical.target.
+# Прежний вариант (WantedBy=multi-user.target + After=graphical.target)
+# давал циклическую зависимость: graphical.target сам стартует после
+# multi-user.target, и systemd молча выбрасывал запуск, разрывая круг —
+# служба не поднималась вообще, без единой записи в журнале.
+# display-manager.service может отсутствовать (сервер, автологин в tty) —
+# тогда эта строка просто игнорируется.
+After=systemd-user-sessions.service display-manager.service
+
+[Service]
+Type=simple
+# доступ к X-серверу для определения активного окна (X11).
+# DISPLAY/XAUTHORITY подставляются установщиком; на Wayland игнорируются.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=__XAUTH__
+ExecStartPre=/sbin/modprobe uinput
+ExecStart=/usr/bin/env python3 /usr/local/lib/autoswitch/autoswitch.py --config /etc/autoswitch/config
+# Служба ведёт СВОЙ журнал (/var/log/autoswitch.log) и пишет туда сама.
+# В системный журнал направляем только сообщения самого systemd о запуске
+# и остановке: набранные пользователем слова не должны попадать в общий
+# журнал, который читают админы и собирают системы мониторинга.
+StandardOutput=null
+StandardError=journal
+
+Restart=on-failure
+RestartSec=3
+# При перезапуске старый процесс должен УСПЕТЬ отпустить клавиатуру, прежде
+# чем новый её захватит. Иначе несколько сотен миллисекунд оба читают ввод
+# и оба исправляют слово — первое слово после установки выходило удвоенным
+# («сттак» вместо «так»). KillMode=control-group + ожидание гарантируют,
+# что к моменту старта нового экземпляра старого уже нет.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=5
+# небольшая пауза перед захватом: даёт ядру освободить прежний grab
+ExecStartPre=/bin/sleep 0.3
+
+[Install]
+# graphical.target: до графики переключать раскладку не для кого.
+# Если пользователь войдёт позже старта службы, движок уточнит тип
+# сессии и композитор сам — см. _refresh_session в autoswitch.py.
+WantedBy=graphical.target

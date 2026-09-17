@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Autoswitch Indicator
+GenericName=Keyboard Layout Switcher Indicator
+Comment=Tray indicator for the autoswitch layout switcher
+Comment[ru]=Индикатор автопереключателя раскладки в трее
+Exec=autoswitch-indicator
+Icon=autoswitch-indicator
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+# только для окружений с системным треем (не GNOME — там своё расширение)
+NotShowIn=GNOME;
