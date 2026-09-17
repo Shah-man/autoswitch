@@ -1,4 +1,15 @@
-# Autoswitch Config
+<p align="center">
+  <img src="icons/autoswitch_256.png" width="120" alt="Autoswitch">
+</p>
+
+<h1 align="center">Autoswitch Config</h1>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPLv3-blue"></a>
+  <a href="https://github.com/Shah-man/autoswitch/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Shah-man/autoswitch"></a>
+  <a href="https://github.com/Shah-man/autoswitch/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Shah-man/autoswitch/total"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/linux-X11%20%7C%20Wayland-informational">
+</p>
 
 A bilingual automatic keyboard layout switcher for Linux.
 
