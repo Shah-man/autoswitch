@@ -67,44 +67,44 @@ window needs — the installer pulls in by itself.
 The program reads your keyboard, so trust is the question that matters
 most. That is why the source is open and can be read end to end.
 
-**Not a single compiled file in the archive.** Text only: bash and python.
-No package to unpack, no binary to disassemble — open it and read, line by
-line.
+- **Not a single compiled file in the archive.** Text only: bash and
+  python. No package to unpack, no binary to disassemble — open it and
+  read, line by line.
 
-**Passwords are neither switched nor recorded.** Input longer than six
-characters that mixes letter cases with digits or symbols is treated as a
-password, and the program steps aside. Such input never reaches the log —
-not even with debug logging turned on.
+- **Passwords are neither switched nor recorded.** Input longer than six
+  characters that mixes letter cases with digits or symbols is treated as a
+  password, and the program steps aside. Such input never reaches the log —
+  not even with debug logging turned on. The same goes for card numbers and
+  any input with digits inside it.
 
-The same goes for card numbers and any input with digits inside it.
+- **A password started in Cyrillic is moved to Latin.** A capital letter
+  after a lowercase one — `myPassword` — is a signal visible by the third
+  character, long before six are typed. People do not write words that way;
+  passwords and machine names do it all the time. Seeing that in a Cyrillic
+  layout, the program switches to Latin, because passwords are almost always
+  English. The input still counts as a password and still stays out of the
+  log.
 
-**A password started in Cyrillic is moved to Latin.** A capital letter
-after a lowercase one — `myPassword`, `мойПароль` — is a signal visible by
-the third character, long before six are typed. People do not write words
-that way; passwords and machine names do it all the time. Seeing that in a
-Cyrillic layout, the program switches to Latin: passwords are almost always
-English, so the layout was simply forgotten. The input still counts as a
-password afterwards and still stays out of the log.
+- **What you type never reaches the system journal.** The program keeps its
+  own log in your home directory, where you can see it and clear it at any
+  moment.
 
-**What you type never reaches the system journal.** The program keeps its
-own log in your home directory, where you can see it and clear it at any
-moment.
+- **Nothing leaves your machine.** No telemetry, no update checks, no
+  licence checks. The program makes no network requests at all.
 
 **About privileges.** The service runs as root: there is no other way in
-Linux to read the keyboard device and type the corrected word back. So what
-matters is not which privileges it holds but what it does with them — and
-that is visible in the code:
+Linux to read the keyboard device and type the corrected word back.
 
-- what you type stays in the program's own log and never goes to the system one;
+So what matters is not which privileges it holds but what it does with
+them — and that is visible in the code:
+
+- what you type stays in the program's own log, never in the system one;
 - passwords are neither parsed nor written down;
 - the program never touches the network;
 - everything the window and the console ask to do as root — editing the
   config or the dictionary, controlling the service — goes through a
   separate helper, `asc-helper`, with a fixed list of actions. Arbitrary
   commands are never run as root.
-
-**Nothing leaves your machine.** The program makes no network requests: no
-telemetry, no update checks, no licence checks.
 
 ---
 
@@ -203,9 +203,11 @@ too.
 menu, where it is called "Autoswitch". From a terminal it is `asc-gui`.
 
 Everything inside is tiles: start, stop, autostart, status, journal,
-settings, manual. **Tiles can be dragged with the mouse** — arrange them as
-you like and the order is remembered. What you use often ends up within
-reach, what you rarely need moves out of the way.
+settings, manual.
+
+**Tiles can be dragged with the mouse** — arrange them as you like and the
+order is remembered. What you use often ends up within reach, what you
+rarely need moves out of the way.
 
 ![Settings in the program window](docs/settings.png)
 
@@ -229,36 +231,36 @@ path, so you never have to remember where you installed from.
 
 ## What it does
 
-**Switches as you type.** The correction usually lands on the space bar,
-but when the language is clear from the first letters the layout changes
-right away, mid-word.
+- **Switches as you type.** The correction usually lands on the space bar,
+  but when the language is clear from the first letters the layout changes
+  right away, mid-word.
 
-**Switches on a single Shift.** Press Shift, release it, touch nothing
-else — the layout changes. It works independently of the system shortcut,
-so your usual key combination stays yours.
+- **Switches on a single Shift.** Press Shift, release it, touch nothing
+  else — the layout changes. It works independently of the system shortcut,
+  so your usual key combination stays yours.
 
-**Can be undone.** When the program gets it wrong, press Shift twice in a
-row, or Pause. The word comes back as you typed it and goes into "My
-dictionary": it will be left alone from then on. That is how the dictionary
-fills up — on its own, as you work. Nothing to set up in advance.
+- **Can be undone.** When the program gets it wrong, press Shift twice in a
+  row, or Pause. The word comes back as you typed it and goes into "My
+  dictionary": it will be left alone from then on. That is how the
+  dictionary fills up — on its own, as you work.
 
-**Lets you edit the dictionary by hand.** Add your own words, look through
-the list, edit the file as a whole or clear it — from the window or the
-console.
+- **Lets you edit the dictionary by hand.** Add your own words, look through
+  the list, edit the file as a whole or clear it — from the window or the
+  console.
 
-**Keeps out of the way where it should.** A terminal, a code editor, a
-program console — such windows go into the exclusions, and inside them the
-program stays silent. Pick a window from the list of open ones, add the one
-currently in focus, or take the ready-made set for Steam games.
+- **Keeps out of the way where it should.** A terminal, a code editor, a
+  program console — such windows go into the exclusions, and inside them the
+  program stays silent. Pick a window from the list of open ones, add the
+  one currently in focus, or take the ready-made set for Steam games.
 
-**Fixes two leading capitals.** `HEllo` becomes `Hello`. Only when the
-corrected word is in the dictionary, so `IDs` and `PCs` are left intact.
+- **Fixes two leading capitals.** `HEllo` becomes `Hello`. Only when the
+  corrected word is in the dictionary, so `IDs` and `PCs` are left intact.
 
-**Knows when it is not looking at a word.** Numbers, addresses, commands
-and machine names all abort the analysis.
+- **Knows when it is not looking at a word.** Numbers, addresses, commands
+  and machine names all abort the analysis.
 
-**Speaks two languages.** Russian and English. The language of the window,
-the console, the log and the manual switches at any moment, on the fly.
+- **Speaks two languages.** Russian and English. The language of the window,
+  the console, the log and the manual switches at any moment, on the fly.
 
 ---
 
