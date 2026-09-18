@@ -21,6 +21,8 @@ Nothing this complete existed for Linux before: X11 and Wayland alike, with
 a panel indicator, its own dictionary, a window and a console menu, across
 many distributions at once. This program fills that gap.
 
+**Presentation:** [English][pres-en] · [Russian][pres-ru]
+
 ![Autoswitch main window](docs/main-window.png)
 
 ---
@@ -370,3 +372,6 @@ GPLv3. The program reads your keyboard, so being open here is not a
 decoration but a condition of trust.
 
 https://github.com/Shah-man/autoswitch
+
+[pres-en]: https://github.com/Shah-man/autoswitch/releases/download/v1.0.0/autoswitch-presentation-en.pdf
+[pres-ru]: https://github.com/Shah-man/autoswitch/releases/download/v1.0.0/autoswitch-presentation-ru.pdf
