@@ -2,8 +2,8 @@
   "uuid": "autoswitch@shah-man.github.io",
   "name": "Autoswitch Focus Bridge",
   "description": "Core part of autoswitch: switches layout and detects the active window (Wayland) + panel indicator. Required — don't disable.",
-  "shell-version": ["45", "46", "47", "48", "49"],
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "url": "https://github.com/Shah-man/autoswitch",
   "settings-schema": "org.gnome.shell.extensions.autoswitch",
-  "version": 11
+  "version": 12
 }
