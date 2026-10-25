@@ -23,7 +23,7 @@ import subprocess
 import sys
 import datetime
 
-VERSION = '1.0'
+VERSION = '1.1.0'
 SERVICE = 'autoswitch'
 CONFIG  = '/etc/autoswitch/config'
 UW      = '/etc/autoswitch/user_words.txt'
@@ -243,6 +243,9 @@ TR = {
         'tiles_reset': 'Сбросить расположение плиток',
         'tiles_reset_done': 'Расположение сброшено',
         'td_hint': 'Слова-исключения: не переключаются автоматически. Формат: слово и язык через пробел — «идее ru» (русским) или «myapp us» (английским). Без языка = английское. Список пополняется сам при отмене исправлений (двойной Shift или Pause).',
+        'td_search_ph': 'Поиск по словарю — в любой раскладке',
+        'td_found': 'Найдено: {n}',
+        'td_find_none': 'Ничего не найдено',
         'td_file_hint': '# Мой словарь. Формат: слово ПРОБЕЛ язык (ru или us)\n#   идее ru   — оставлять русским\n#   myapp us  — оставлять английским\n# Слово без языка = английское. Пополняется сам при отмене исправлений.',
         'td_note': 'Эталонная база (1387 слов) неизменна.\\nЗдесь — только ваши добавления:',
         'td_reset': 'Восстановить по умолчанию',
@@ -444,6 +447,9 @@ TR = {
         'tiles_reset': 'Reset tile layout',
         'tiles_reset_done': 'Layout reset',
         'td_hint': 'Exception words: not switched automatically. Format: word and language, e.g. "hello us" or "myapp us". No language = English. The list also grows on its own when you undo a correction (double Shift or Pause).',
+        'td_search_ph': 'Search the dictionary — any layout',
+        'td_found': 'Found: {n}',
+        'td_find_none': 'Nothing found',
         'td_file_hint': '# My dictionary. Format: word SPACE language (ru or us)\n#   hello us  — keep in English\n#   привет ru — keep in Russian\n# Word without a language = English. Grows on its own when you undo a fix.',
         'td_note': 'Reference base (1387 words) is fixed.\\nHere are only your additions:',
         'td_reset': 'Reset to default',
@@ -2757,18 +2763,8 @@ class AscGui(Gtk.Window):
         слово есть в обоих, но с разным языком; берём из файла, ведь
         человек принёс его осознанно.
         """
-        words = {}
-        for src in (None, imported):
-            lines = []
-            if src is None:
-                try:
-                    with open(LEARNED, encoding='utf-8',
-                              errors='replace') as f:
-                        lines = f.read().splitlines()
-                except OSError:
-                    lines = []
-            else:
-                lines = src
+        def read(lines):
+            words = {}
             for ln in lines:
                 ln = ln.strip()
                 if not ln or ln.startswith('#'):
@@ -2777,7 +2773,23 @@ class AscGui(Gtk.Window):
                 if not parts:
                     continue
                 lang = parts[1].lower() if len(parts) > 1 else 'us'
-                words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
+                w = parts[0].lower()
+                if w not in words:         # повтор — побеждает верхняя запись
+                    words[w] = lang if lang in ('ru', 'us') else 'us'
+            return words
+
+        try:
+            with open(LEARNED, encoding='utf-8', errors='replace') as f:
+                own = read(f.read().splitlines())
+        except OSError:
+            own = {}
+        came = read(imported)
+        # Порядок: принесённые наверху (самое свежее), за ними свои.
+        # Сортировки нет — как и везде в словаре.
+        words = dict(came)
+        for w, l in own.items():
+            if w not in words:
+                words[w] = l
         return words
 
     def on_export(self):
@@ -2812,7 +2824,7 @@ class AscGui(Gtk.Window):
                              self.t('imp_ask_m').format(f=path)):
             return
         words = self._merge_learned(learned)
-        payload = '\n'.join('%s\t%s' % (w, l) for w, l in sorted(words.items()))
+        payload = '\n'.join('%s\t%s' % (w, l) for w, l in words.items())
         run(['pkexec', HELPER, 'write-config'], input_text=conf)
         run(['pkexec', HELPER, 'write-learned'], input_text=payload + '\n')
         poke_indicator()
@@ -3379,6 +3391,47 @@ class AscGui(Gtk.Window):
         info.set_margin_bottom(6)
         root.pack_start(info, False, False, 0)
 
+        # ── поиск ────────────────────────────────────────────────────
+        # Найденное показывается ОТДЕЛЬНОЙ панелью над словарём, а сам
+        # словарь под ней остаётся целиком. Так можно пройти по всем
+        # найденным словам подряд, правя каждое, — панель не исчезает.
+        # И «Сохранить» безопасна в любой момент: ничего не скрыто, в файл
+        # уходит весь словарь, а панель — только подсказка, её не пишут.
+        sbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        sbox.set_margin_start(14)
+        sbox.set_margin_end(14)
+        sbox.set_margin_bottom(6)
+        self.td_search = Gtk.SearchEntry()
+        self.td_search.set_placeholder_text(self.t('td_search_ph'))
+        self.td_search.connect('search-changed', lambda _e: self._td_find())
+        # Enter — сразу к первому найденному, Esc — очистить поиск
+        self.td_search.connect('activate', lambda _e: self._td_goto_first())
+        self.td_search.connect('stop-search',
+                               lambda e: e.set_text(''))
+        sbox.pack_start(self.td_search, True, True, 0)
+        self.td_found = Gtk.Label()
+        sbox.pack_start(self.td_found, False, False, 0)
+        root.pack_start(sbox, False, False, 0)
+
+        self.td_res_scroll = Gtk.ScrolledWindow()
+        self.td_res_scroll.set_policy(Gtk.PolicyType.NEVER,
+                                      Gtk.PolicyType.AUTOMATIC)
+        # не выше пяти-шести строк: словарь под панелью должен быть виден
+        self.td_res_scroll.set_max_content_height(150)
+        self.td_res_scroll.set_propagate_natural_height(True)
+        self.td_res_scroll.set_margin_start(14)
+        self.td_res_scroll.set_margin_end(14)
+        self.td_res_scroll.set_margin_bottom(6)
+        self.td_res_list = Gtk.ListBox()
+        self.td_res_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.td_res_list.set_activate_on_single_click(True)
+        self.td_res_list.connect('row-activated',
+                                 lambda _lb, row: self._td_goto(row))
+        self.td_res_scroll.add(self.td_res_list)
+        self.td_res_scroll.set_no_show_all(True)   # показываем, когда есть что
+        root.pack_start(self.td_res_scroll, False, False, 0)
+        self._td_find_id = 0
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.td_view = Gtk.TextView()
@@ -3389,6 +3442,8 @@ class AscGui(Gtk.Window):
         self.td_view.set_right_margin(12)
         self.td_view.set_top_margin(10)
         self.td_buf = self.td_view.get_buffer()
+        # правишь словарь — панель найденного обновляется сама
+        self.td_buf.connect('changed', self._td_buf_changed)
         scroll.add(self.td_view)
         root.pack_start(scroll, True, True, 0)
         return root
@@ -3413,10 +3468,103 @@ class AscGui(Gtk.Window):
                     lines.append('%s\t%s' % (us_to_display(form, lang), lang))
         except Exception:
             pass
-        header = self.t('td_file_hint') + '\n\n'
-        self.td_buf.set_text(header + '\n'.join(lines) + ('\n' if lines else ''))
+        header = self.t('td_file_hint') + '\n'
+        # Сразу под пояснением — пустая строка для нового слова, и курсор
+        # на ней. Она же отделяет пояснение от списка. Раньше курсор стоял
+        # в конце списка, и чтобы дописать слово, приходилось листать весь
+        # словарь вниз. Пустую строку
+        # сохранение пропускает, так что если ничего не вписали — не беда.
+        body = '\n'.join(lines) + ('\n' if lines else '')
+        self.td_search.set_text('')
+        self.td_buf.set_text(header + '\n' + body)
+        line = header.count('\n')
+        it = self.td_buf.get_iter_at_line(line)
+        if isinstance(it, tuple):          # в части версий GTK — (ok, iter)
+            it = it[-1]
+        self.td_buf.place_cursor(it)
         self._nav_to('techdict')
-        GLib.idle_add(self.td_view.grab_focus)
+        GLib.idle_add(self._td_focus_top)
+
+    def _td_buf_changed(self, _buf):
+        # пересчитываем найденное с небольшой задержкой — не на каждую букву
+        if self.td_search.get_text().strip() and not self._td_find_id:
+            self._td_find_id = GLib.timeout_add(250, self._td_find)
+
+    def _td_find(self):
+        """Заполнить панель найденного. Ищем по тому, как слово видно в
+        поле, и сразу в обеих раскладках: «ghbdtn» найдёт «привет»."""
+        self._td_find_id = 0
+        for row in self.td_res_list.get_children():
+            self.td_res_list.remove(row)
+        q = self.td_search.get_text().strip().lower()
+        if not q:
+            self.td_res_scroll.hide()
+            self.td_found.set_text('')
+            return False
+        qs = {q, ''.join(_US2RU.get(c, c) for c in q),
+              ''.join(_RU2US.get(c, c) for c in q)}
+        s, e = self.td_buf.get_bounds()
+        hits = []
+        for no, ln in enumerate(self.td_buf.get_text(s, e, True).split('\n')):
+            st = ln.strip()
+            if not st or st.startswith('#'):
+                continue
+            parts = st.replace('\t', ' ').split()
+            if any(x in parts[0].lower() for x in qs):
+                hits.append((no, parts))
+        for no, parts in hits:
+            row = Gtk.ListBoxRow()
+            row._line = no
+            lbl = Gtk.Label(xalign=0)
+            lang = parts[1] if len(parts) > 1 else ''
+            lbl.set_markup('<span font_family="monospace">%s  '
+                           '<span foreground="%s">%s</span></span>'
+                           % (GLib.markup_escape_text(parts[0]), GRAY,
+                              GLib.markup_escape_text(lang)))
+            lbl.set_margin_start(8)
+            row.add(lbl)
+            self.td_res_list.add(row)
+        if hits:
+            self.td_found.set_markup('<span foreground="%s">%s</span>'
+                                     % (CYAN, self.t('td_found').format(n=len(hits))))
+            self.td_res_list.show_all()
+            self.td_res_scroll.show()
+        else:
+            self.td_found.set_markup('<span foreground="%s">%s</span>'
+                                     % (YELLOW, self.t('td_find_none')))
+            self.td_res_scroll.hide()
+        return False
+
+    def _td_goto(self, row):
+        """Перейти к найденному слову в словаре: прокрутить к нему и
+        выделить, курсор — в поле правки. Панель найденного остаётся."""
+        it = self.td_buf.get_iter_at_line(row._line)
+        if isinstance(it, tuple):          # в части версий GTK — (ok, iter)
+            it = it[-1]
+        end = it.copy()
+        while not end.ends_line() and not end.get_char().isspace():
+            end.forward_char()
+        self.td_buf.select_range(it, end)
+        self.td_view.grab_focus()
+        self.td_view.scroll_to_iter(it, 0.1, True, 0.0, 0.3)
+
+    def _td_goto_first(self):
+        # поле поиска обновляет результат с небольшой задержкой — по Enter
+        # не ждём её, а ищем сразу по тому, что набрано сейчас
+        if self._td_find_id:
+            GLib.source_remove(self._td_find_id)
+        self._td_find()
+        rows = self.td_res_list.get_children()
+        if rows:
+            self._td_goto(rows[0])
+
+    def _td_focus_top(self):
+        # Фокус в поле и прокрутка к началу: видно и пояснение, и строку
+        # с курсором. Делаем в idle — до этого вид ещё не знает размеров.
+        self.td_view.grab_focus()
+        self.td_view.scroll_to_iter(self.td_buf.get_start_iter(),
+                                    0.0, True, 0.0, 0.0)
+        return False
 
     def _td_save(self):
         s, e = self.td_buf.get_bounds()
@@ -3436,10 +3584,13 @@ class AscGui(Gtk.Window):
                 lang = 'us'
             out.append('%s\t%s' % (display_to_us(word), lang))
         payload = '\n'.join(out) + ('\n' if out else '')
-        try:
-            run(['pkexec', HELPER, 'write-learned'], input_text=payload)
-        except Exception:
-            pass
+        # Раньше результат записи не проверялся: что бы ни случилось с
+        # помощником, окно показывало «Сохранено». Теперь при ошибке
+        # остаёмся в словаре — набранное не теряется — и говорим об этом.
+        rc, _out = run(['pkexec', HELPER, 'write-learned'], input_text=payload)
+        if rc != 0:
+            self._show_toast(self.t('error'), ms=3000)
+            return
         self._nav_back()
         self._show_toast(self.t('saved'))
 

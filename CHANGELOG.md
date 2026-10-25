@@ -4,6 +4,45 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-25
+
+### Fixed
+
+- Words with a digit inside — script and tool names such as `f2b`, `x11`,
+  `h264` — are no longer altered. The digit used to be skipped while the
+  letters around it were glued into one word, so `f2b` could come out as
+  `аи2`. Any input with a digit in it is now left alone as a whole and never
+  reaches the log, as the user manual has always promised.
+- Words added to "My dictionary" by hand no longer vanish. When the service
+  learned from an undo, it rewrote the dictionary from memory and could drop
+  a word added from the window or the console moments earlier. It now
+  re-reads the file before every write.
+- The dictionary window no longer reports "Saved" when the save failed. It
+  now says so and stays open, so nothing you typed is lost.
+
+### Added
+
+- Search in "My dictionary", in the window and in the console. It finds a
+  word in either layout: `ghbdtn` finds `привет`, `руддщ` finds `hello`.
+  - In the window, the matches appear in a panel above the full dictionary.
+    Clicking one jumps the editor to that word. The panel stays put and
+    updates as you edit, so you can fix several words in a row. "Save" works
+    at any time and always writes the whole dictionary.
+  - In the console, the new "Find a word" item lists the matches. For each
+    match you can switch its language or delete it, then pick the next word
+    from the same list.
+
+### Changed
+
+- "My dictionary" keeps the order in which words were added, newest first,
+  instead of sorting them alphabetically. A word you have just added or the
+  program has just learned is at the top, where you can see it. This
+  applies everywhere: the window, the console, words learned from undo,
+  imported settings and the installer.
+- "My dictionary" opens ready for a new word, both in the window and with
+  "Edit file" in the console. The cursor is on an empty line right under
+  the hint, so there is no scrolling to the end of a long list.
+
 ## [1.0.0] — 2026-09-17
 
 First public release.

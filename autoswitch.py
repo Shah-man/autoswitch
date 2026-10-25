@@ -148,14 +148,24 @@ LAYOUT = {
 # исправление срабатывало бы сразу после "!" вместо пробела.
 WORD_BREAK = {'KEY_SPACE', 'KEY_ENTER', 'KEY_KPENTER', 'KEY_TAB'}
 
-# Клавиши, которые прерывают набор слова, но НЕ запускают исправление:
-# цифровой ряд и знаки, которых нет в LAYOUT. Слово перед ними остаётся
-# в буфере и будет проверено, когда пользователь нажмёт пробел.
+# Клавиши цифрового ряда и знаки, которых нет в LAYOUT. Сами в слово не
+# входят: пропускаются как есть, а исправление по-прежнему ждёт пробела.
+# Знаки после слова («привет!») правке не мешают. А вот цифра без Shift
+# делает весь набор неприкосновенным — см. NUMBER_KEYS ниже.
 PUNCT_KEYS = {
     'KEY_1', 'KEY_2', 'KEY_3', 'KEY_4', 'KEY_5',
     'KEY_6', 'KEY_7', 'KEY_8', 'KEY_9', 'KEY_0',
     'KEY_MINUS', 'KEY_EQUAL', 'KEY_BACKSLASH',
 }
+
+# Цифра без Shift в любом месте набора — признак имени, кода или пароля:
+# f2b, x11, h264, md5sum, pass99. Такой набор не исправляется целиком и в
+# журнал не попадает. Раньше цифра обрабатывалась как знак препинания:
+# движок её пропускал, а буквы вокруг склеивал в одно «слово» — из f2b
+# получалось fb, и его перепечатывало. Знаки через Shift (!, ?, @) сюда не
+# относятся: «привет!» по-прежнему правится.
+NUMBER_KEYS = {'KEY_1', 'KEY_2', 'KEY_3', 'KEY_4', 'KEY_5',
+               'KEY_6', 'KEY_7', 'KEY_8', 'KEY_9', 'KEY_0'}
 
 EN_LETTERS = set('abcdefghijklmnopqrstuvwxyz')
 RU_LETTERS = set('абвгдежзийклмнопрстуфхцчшщъыьэюяё')
@@ -245,7 +255,7 @@ SHIFT_SWITCHES_LAYOUT = True  # одиночный Shift переключает 
 # (как в Caramba). Заглавные буквы не задевает: Shift+буква работает как
 # обычно, потому что переключение срабатывает только когда Shift нажали и
 # отпустили, не тронув других клавиш. Из конфига shift_switches_layout.
-VERSION = '1.0'       # версия программы (видна в журнале и в «О программе»)
+VERSION = '1.1.0'     # версия программы (видна в журнале и в «О программе»)
 PASSWORD_MIN_LEN = 6  # от скольких знаков набор может считаться паролем
 # (как в Caramba). Пароли не конвертируются и НИКОГДА не логируются.
 DIGIT_KEYS = {'KEY_1','KEY_2','KEY_3','KEY_4','KEY_5','KEY_6','KEY_7',
@@ -618,7 +628,9 @@ def load_learned():
                     form, lang = parts
                 form = _to_us_form(form.strip())
                 lang = lang.strip().lower()
-                if form and lang in ('ru', 'us'):
+                # порядок файла сохраняем (наверху — самое свежее), при
+                # повторе слова побеждает верхняя, то есть более новая запись
+                if form and lang in ('ru', 'us') and form not in d:
                     d[form] = lang
     except FileNotFoundError:
         _learned_mtime = 0
@@ -643,9 +655,21 @@ def save_learned_rule(us_form, lang):
     us_form = _to_us_form((us_form or '').strip())
     if not us_form or lang not in ('ru', 'us'):
         return
+    # Сначала перечитать файл с диска. Файл пишут и окно, и консоль, а
+    # движок сверялся с ним только между обычными словами. Если человек
+    # добавлял слово вручную и сразу отменял какую-нибудь правку, движок
+    # переписывал словарь из УСТАРЕВШЕЙ памяти — и только что добавленное
+    # слово стиралось. Перечитывание перед записью это закрывает.
+    _refresh_learned()
     if LEARNED.get(us_form) == lang:
         return
+    # Новое слово встаёт первым: наверху словаря — всегда самое свежее, кто
+    # бы его ни добавил, человек или движок при отмене. Раньше файл
+    # сортировался, и добавленное слово уезжало в середину списка.
+    rest = [(k, v) for k, v in LEARNED.items() if k != us_form]
+    LEARNED.clear()
     LEARNED[us_form] = lang
+    LEARNED.update(rest)
     global _learned_mtime
     try:
         os.makedirs(os.path.dirname(LEARNED_FILE), exist_ok=True)
@@ -653,7 +677,7 @@ def save_learned_rule(us_form, lang):
         with open(tmp, 'w', encoding='utf-8') as f:
             f.write('# autoswitch: выученные слова (US-форма<TAB>ru|us).\n')
             f.write('# Пополняется автоматически при отмене исправления.\n')
-            for form in sorted(LEARNED):
+            for form in LEARNED:                 # порядок словаря, без сортировки
                 f.write(f'{form}\t{LEARNED[form]}\n')
         os.replace(tmp, LEARNED_FILE)
         try:
@@ -1619,8 +1643,13 @@ def main():
             # слово в буфере НЕ трогаем — исправление сработает по пробелу.
             if kc in PUNCT_KEYS:
                 ui.write(e.EV_KEY, event.code, event.value); ui.syn()
-                if event.value == 1 and buffer:
-                    tail_keys.append((event.code, shift_down))
+                if event.value == 1:
+                    if buffer:
+                        tail_keys.append((event.code, shift_down))
+                    # цифра без Shift — весь набор до пробела не трогаем
+                    # (флаг снимается только на границе слова, в _reset_word)
+                    if kc in NUMBER_KEYS and not shift_down:
+                        complex_input = True
                 continue
 
             ui.write(e.EV_KEY, event.code, event.value); ui.syn()

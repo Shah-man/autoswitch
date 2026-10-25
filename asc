@@ -28,6 +28,89 @@ US2RU = dict(zip(KB_US, KB_RU))
 RU2US = dict(zip(KB_RU, KB_US))
 '
 
+# Правка одной записи словаря, файл пишется напрямую (asc работает от root).
+#   learned_op top  WORD LANG — поставить слово первым: наверху словаря
+#                               всегда самое свежее, повтор слова убирается
+#   learned_op lang WORD LANG — сменить язык, место в списке не меняется
+#   learned_op del  WORD      — удалить запись
+# WORD — US-форма. Порядок остальных строк не трогаем, сортировки нет.
+learned_op() {
+    python3 - "$LEARNED" "$@" <<'PYOP'
+import sys
+path, op, word = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+lang = sys.argv[4] if len(sys.argv) > 4 else 'us'
+head, rows = [], []
+try:
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for ln in f.read().splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith('#'):
+                if not rows:
+                    head.append(s)
+                continue
+            parts = s.replace('\t', ' ').split()
+            w = parts[0].lower()
+            l = parts[1].lower() if len(parts) > 1 else 'us'
+            if any(r[0] == w for r in rows):     # повтор — верхняя главнее
+                continue
+            rows.append([w, l if l in ('ru', 'us') else 'us'])
+except OSError:
+    pass
+if op == 'top':
+    rows = [[word, lang]] + [r for r in rows if r[0] != word]
+elif op == 'lang':
+    for r in rows:
+        if r[0] == word:
+            r[1] = lang
+elif op == 'del':
+    rows = [r for r in rows if r[0] != word]
+if not head:
+    head = ['# autoswitch: мой словарь (US-форма<TAB>ru|us).']
+with open(path, 'w', encoding='utf-8') as f:
+    for h in head:
+        f.write(h + '\n')
+    for w, l in rows:
+        f.write('%s\t%s\n' % (w, l))
+PYOP
+}
+
+# Поиск по словарю. Ищем по тому, как слово выглядит на экране, и сразу в
+# обеих раскладках: «ghbdtn» найдёт «привет», «руддщ» — «hello». Без учёта
+# регистра, по части слова. Вывод: US-форма<TAB>язык<TAB>как на экране<TAB>
+# строка для меню (выравниваем здесь: printf в bash считает байты, и
+# русские слова съезжали бы).
+learned_find() {
+    python3 -c "$_PY_KB"'
+import sys
+path, q = sys.argv[1], sys.argv[2].strip().lower()
+if not q:
+    sys.exit(0)
+qs = {q, "".join(US2RU.get(c, c) for c in q), "".join(RU2US.get(c, c) for c in q)}
+seen = set()
+try:
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.replace("\t", " ").split()
+            form = parts[0].lower()
+            lang = parts[1].lower() if len(parts) > 1 else "us"
+            if lang not in ("ru", "us"):
+                lang = "us"
+            if form in seen:
+                continue
+            seen.add(form)
+            shown = "".join(US2RU.get(c, c) for c in form) if lang == "ru" else form
+            if any(x in shown for x in qs):
+                print("%s\t%s\t%s\t%s" % (form, lang, shown, shown.ljust(20) + " " + lang))
+except OSError:
+    pass
+' "$LEARNED" "$1" 2>/dev/null
+}
+
 # слово в любой раскладке -> US-форма (для записи в файл)
 learned_to_us() {
     python3 -c "$_PY_KB"'
@@ -118,9 +201,18 @@ for ln in textwrap.wrap(t, 72) or [""]:
     print("# " + ln)'
         echo
         printf '%b\n\n' "$(t td_file_hint)"
-        learned_show "$LEARNED" plain
     } > "$tmp"
-    "$EDITOR_BIN" "$tmp"
+    # Пустая строка сразу под пояснением — место для нового слова, и
+    # редактор открывается прямо на ней, как окно: листать словарь до
+    # конца не нужно. Номер строки «+N» понимают не все редакторы, поэтому
+    # передаём его только тем, кто точно понимает, — иначе неизвестный
+    # редактор открыл бы ещё и файл с именем «+N».
+    local at; at="$(wc -l < "$tmp")"
+    learned_show "$LEARNED" plain >> "$tmp"
+    case "$(basename "$EDITOR_BIN")" in
+        nano|vi|vim|nvim|micro|emacs|mcedit|joe|ne) "$EDITOR_BIN" "+$at" "$tmp" ;;
+        *) "$EDITOR_BIN" "$tmp" ;;
+    esac
     helper="$(command -v asc-helper 2>/dev/null || echo /usr/local/bin/asc-helper)"
     if [ -x "$helper" ]; then
         learned_to_file "$tmp" | "$helper" write-learned
@@ -332,6 +424,15 @@ t() {
             td_edited)    echo "Файл изменён" ;;
             td_applied)   echo "перезапуск не нужен, изменения применяются сразу" ;;
             td_updated)   echo "Мой словарь обновлён" ;;
+            td_find)      echo "Найти слово" ;;
+            td_find_p)    echo "Слово или его часть, в любой раскладке:" ;;
+            td_found)     echo "Найдено" ;;
+            td_find_none) echo "Ничего не найдено" ;;
+            td_find_hint) echo "Выберите слово, чтобы сменить ему язык или удалить его." ;;
+            td_act_lang)  echo "Сменить язык" ;;
+            td_act_del)   echo "Удалить" ;;
+            td_act_now)   echo "сейчас" ;;
+            td_del_q)     echo "Удалить слово из словаря?" ;;
             td_reset_t)   echo "Очистить мой словарь" ;;
             td_reset_m)   echo "Все ВАШИ добавленные и выученные слова будут удалены.\nВстроенная база команд останется.\n\nПродолжить?" ;;
             td_reset_pw)  echo "Подтверждение очистки" ;;
@@ -479,6 +580,15 @@ t() {
             td_edited)    echo "File changed" ;;
             td_applied)   echo "no restart needed, changes apply immediately" ;;
             td_updated)   echo "My dictionary updated" ;;
+            td_find)      echo "Find a word" ;;
+            td_find_p)    echo "A word or part of it, in any layout:" ;;
+            td_found)     echo "Found" ;;
+            td_find_none) echo "Nothing found" ;;
+            td_find_hint) echo "Pick a word to change its language or delete it." ;;
+            td_act_lang)  echo "Change language" ;;
+            td_act_del)   echo "Delete" ;;
+            td_act_now)   echo "now" ;;
+            td_del_q)     echo "Delete this word from the dictionary?" ;;
             td_reset_t)   echo "Clear my dictionary" ;;
             td_reset_m)   echo "All YOUR added and learned words will be removed.\nThe built-in command base remains.\n\nProceed?" ;;
             td_reset_pw)  echo "Clear confirmation" ;;
@@ -1342,17 +1452,19 @@ settings_import() {
 
     # Словарь СЛИВАЕМ: свои слова остаются, принесённые добавляются и
     # при совпадении перекрывают — человек принёс файл осознанно.
-    # Ключ уникален по построению, поэтому дубликатов не возникает.
+    # Порядок: принесённые наверху (это самое свежее), за ними свои.
+    # Сортировки нет — как и везде в словаре, новое видно сразу.
     local merged
     merged="$(python3 - "$LEARNED" "$tmpl" <<'PY'
 import sys
-words = {}
-for path in sys.argv[1:]:
+
+def read(path):
+    words = {}
     try:
         with open(path, encoding='utf-8', errors='replace') as f:
             lines = f.read().splitlines()
     except OSError:
-        continue
+        return words
     for ln in lines:
         ln = ln.strip()
         if not ln or ln.startswith('#'):
@@ -1361,9 +1473,17 @@ for path in sys.argv[1:]:
         if not parts:
             continue
         lang = parts[1].lower() if len(parts) > 1 else 'us'
-        words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
-for w in sorted(words):
-    print('%s\t%s' % (w, words[w]))
+        w = parts[0].lower()
+        if w not in words:                 # повтор — побеждает верхняя запись
+            words[w] = lang if lang in ('ru', 'us') else 'us'
+    return words
+
+own, came = read(sys.argv[1]), read(sys.argv[2])
+for w, l in came.items():
+    print('%s\t%s' % (w, l))
+for w, l in own.items():
+    if w not in came:
+        print('%s\t%s' % (w, l))
 PY
 )"
     printf '%s\n' "$merged" | asc-helper write-learned 2>/dev/null \
@@ -1465,6 +1585,61 @@ submenu_settings() {
     done
 }
 
+# «Найти слово»: список найденного, у каждого слова — смена языка или
+# удаление. После действия возвращаемся в тот же список, уже обновлённый,
+# и можно сразу перейти к следующему слову — искать заново не нужно.
+learned_search() {
+    local q
+    q="$("$DIALOG" --backtitle "$BACKTITLE" --title "$(t td_find)" \
+          --ok-label "$(t select)" --cancel-label "$(t back)" \
+          --inputbox "$(t td_find_p)" 9 56 3>&1 1>&2 2>&3)" || return
+    q="$(printf '%s' "$q" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$q" ] && return
+    local sel="1"
+    while true; do
+        local found=() line
+        while IFS= read -r line; do
+            [ -n "$line" ] && found+=("$line")
+        done < <(learned_find "$q")
+        if [ "${#found[@]}" -eq 0 ]; then
+            d_msg "$(t td_find)" "$(t td_find_none): $q"
+            return
+        fi
+        local items=() i=0 form lang shown
+        for line in "${found[@]}"; do
+            i=$((i + 1))
+            IFS=$'\t' read -r form lang shown label <<< "$line"
+            items+=("$i" "$label")
+        done
+        [ "$sel" -gt "$i" ] 2>/dev/null && sel="$i"
+        local ch
+        ch="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+              --title "$(t td_find): $q" \
+              --default-item "$sel" \
+              --ok-label "$(t select)" --cancel-label "$(t back)" \
+              --menu "$(t td_found): \Zb${#found[@]}\Zn\n\n$(t td_find_hint)" \
+              $(msize "${#found[@]}" 3) \
+              "${items[@]}" \
+              3>&1 1>&2 2>&3)" || return
+        [ -z "$ch" ] && return
+        sel="$ch"
+        IFS=$'\t' read -r form lang shown label <<< "${found[$((ch - 1))]}"
+        local other act
+        if [ "$lang" = ru ]; then other=us; else other=ru; fi
+        act="$("$DIALOG" --backtitle "$BACKTITLE" --colors \
+              --title "$shown" \
+              --ok-label "$(t select)" --cancel-label "$(t back)" \
+              --menu "$(t td_act_now): $lang" $(msize 2 1) \
+              lang "\Z5$(t td_act_lang): $lang → $other\Zn" \
+              del  "\Z3$(t td_act_del)\Zn" \
+              3>&1 1>&2 2>&3)" || continue
+        case "$act" in
+            lang) learned_op lang "$form" "$other" ;;
+            del)  d_confirm "$shown" "$(t td_del_q)" && learned_op del "$form" ;;
+        esac
+    done
+}
+
 submenu_techdict() {
     while true; do
            local n=0
@@ -1474,11 +1649,12 @@ submenu_techdict() {
                  --title "$(t td_title)" \
                  --ok-label "$(t select)" --cancel-label "$(t back)" \
                  --menu "$(t td_count): \Zb$n\Zn\n\n$(t td_note)" \
-                 $(msize 4 4) \
+                 $(msize 5 4) \
                  1 "\Z2$(t td_add)\Zn" \
-                 2 "\Z6$(t td_view)\Zn" \
-                 3 "\Z3$(t td_edit)\Zn" \
-                 4 "\Z1$(t td_reset)\Zn" \
+                 2 "\Z5$(t td_find)\Zn" \
+                 3 "\Z6$(t td_view)\Zn" \
+                 4 "\Z3$(t td_edit)\Zn" \
+                 5 "\Z1$(t td_reset)\Zn" \
                  3>&1 1>&2 2>&3)"
            [ $? -ne 0 ] && break
            clear_all
@@ -1507,17 +1683,15 @@ submenu_techdict() {
                   # словаре смешались бы записи двух видов
                   shown="$word"
                   word="$(learned_to_us "$word")"
-                  if grep -qiE "^${word}[[:space:]]" "$LEARNED" 2>/dev/null; then
-                      # обновить язык у существующей записи
-                      sed -i "s#^${word}[[:space:]].*#${word}\t${wlang}#I" "$LEARNED"
-                  else
-                      printf '%s\t%s\n' "$word" "$wlang" >> "$LEARNED"
-                  fi
+                  # слово встаёт первым — наверху словаря всегда самое
+                  # свежее; если оно уже было, старая строка убирается
+                  learned_op top "$word" "$wlang"
                   # Перезапуск не нужен: движок следит за временем
                   # изменения learned.txt и перечитывает его на ходу
                   # (_refresh_learned на каждом разделителе слов).
                   show_result "$(t td_added): $shown ($wlang)" ;;
-               2) clear; echo "=== $(t td_your) ($LEARNED) ==="; echo
+               2) learned_search ;;
+               3) clear; echo "=== $(t td_your) ($LEARNED) ==="; echo
                   # Те же два блока и в том же порядке, что в окне
                   # asc-gui: сверху абзац-пояснение, ниже комментарии
                   # из файла. Текст взят из asc-gui дословно.
@@ -1529,13 +1703,13 @@ submenu_techdict() {
                       learned_show "$LEARNED"
                   else echo "  $(t td_empty)"; fi
                   echo; read_esc_or_enter ;;
-               3) learned_edit
+               4) learned_edit
                   # перезапуск не нужен — файл перечитывается на ходу
                   # Заголовок в show_result однострочный, и печатается он
                   # через echo без -e: "\n" попал бы в вывод буквально.
                   # Поэтому соединяем тире, а не переносом строки.
                   show_result "$(t td_updated) — $(t td_applied)" ;;
-               4) if d_confirm "$(t td_reset_t)" "$(t td_reset_m)"; then
+               5) if d_confirm "$(t td_reset_t)" "$(t td_reset_m)"; then
                       if d_password "$(t td_reset_pw)"; then
                           rm -f "$LEARNED"; show_result "$(t td_reset_ok)"
                       fi

@@ -130,7 +130,8 @@ case "$cmd" in
                     if (lang!="ru" && lang!="us") lang="us"
                     print tolower(form) "\t" lang
                 }
-            ' | sort -u
+            ' | awk -F'\t' '!seen[$1]++'   # повторы прочь, порядок как был:
+                                           # наверху — самое свежее
         } > "$tmp"
         mv -f "$tmp" "$LEARNED"
         chmod 644 "$LEARNED"

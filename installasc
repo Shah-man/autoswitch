@@ -1009,7 +1009,9 @@ def read(path):
                 if not parts:
                     continue
                 lang = parts[1].lower() if len(parts) > 1 else 'us'
-                words[parts[0].lower()] = lang if lang in ('ru', 'us') else 'us'
+                w = parts[0].lower()
+                if w not in words:         # повтор — побеждает верхняя запись
+                    words[w] = lang if lang in ('ru', 'us') else 'us'
     except OSError:
         pass
     return words, head
@@ -1018,14 +1020,19 @@ def read(path):
 cur, head = read(dst)
 new, _ = read(inc)
 added = sum(1 for w in new if w not in cur)
-cur.update(new)
+# принесённые наверху (самое свежее), за ними свои; без сортировки
+merged = dict(new)
+for w, l in cur.items():
+    if w not in merged:
+        merged[w] = l
+cur = merged
 if not head:
     head = ['# autoswitch: мой словарь (US-форма<TAB>ru|us).']
 try:
     with open(dst, 'w', encoding='utf-8') as f:
         for line in head:
             f.write(line + '\n')
-        for word in sorted(cur):
+        for word in cur:
             f.write('%s\t%s\n' % (word, cur[word]))
 except OSError:
     added = 0
